@@ -1,10 +1,12 @@
 const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 const MAX_HISTORY_MESSAGES = 8;
-const MAX_HISTORY_MESSAGE_CHARS = 1200;
+const MAX_HISTORY_MESSAGE_CHARS = 300;
+// Yandex rejects responses whose session_state JSON exceeds 1 KB; keep a safety margin.
+const MAX_SESSION_STATE_BYTES = 900;
 const MAX_ALICE_TEXT = 1024;
-const TOTAL_RESPONSE_BUDGET_MS = 3600;
+const TOTAL_RESPONSE_BUDGET_MS = 4000;
 const SERPER_TIMEOUT_MS = 600;
-const GEMINI_TIMEOUT_MS = 2500;
+const GEMINI_TIMEOUT_MS = 3300;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -21,8 +23,16 @@ function aliceResponse(text, endSession = false, history = []) {
       text: fitAliceText(text),
       end_session: endSession
     },
-    session_state: { history }
+    session_state: { history: fitHistoryToBytes(history) }
   };
+}
+
+function fitHistoryToBytes(history, maxBytes = MAX_SESSION_STATE_BYTES) {
+  const items = safeHistory(history);
+  while (items.length && Buffer.byteLength(JSON.stringify({ history: items }), "utf8") > maxBytes) {
+    items.shift();
+  }
+  return items;
 }
 
 function fitAliceText(value) {
@@ -141,7 +151,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
         contents,
         generationConfig: {
           temperature: 0.5,
-          maxOutputTokens: 240
+          maxOutputTokens: 512
         }
       })
     },
@@ -150,7 +160,8 @@ async function askGemini(text, history, searchContext, timeoutMs) {
 
   if (!response.ok) {
     const status = Number(response.status);
-    console.error("Gemini request failed with HTTP", status);
+    const detail = String(data?.error?.message || "").slice(0, 300);
+    console.error("Gemini request failed with HTTP", status, detail);
     if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
     if (status === 429) throw new Error("GEMINI_QUOTA");
     throw new Error("GEMINI_REQUEST_FAILED");
@@ -183,7 +194,6 @@ function errorForUser(error) {
     case "GEMINI_BLOCKED":
       return "Я не смогла обработать этот запрос. Попробуйте спросить иначе.";
     case "TIME_BUDGET_EXHAUSTED":
-    case "AbortError":
       return "Не успела подготовить ответ. Попробуйте задать вопрос ещё раз, чуть короче.";
     default:
       return "Не получилось получить ответ от нейросети. Попробуйте ещё раз чуть позже.";
@@ -207,6 +217,19 @@ export default async function handler(req, res) {
   const startedAt = Date.now();
   const remainingMs = () => TOTAL_RESPONSE_BUDGET_MS - (Date.now() - startedAt);
   const body = req.body && typeof req.body === "object" ? req.body : {};
+
+  // Optional protection: only accept requests from your own skill, so strangers cannot spend your API quota.
+  const expectedSkillId = String(process.env.ALICE_SKILL_ID || "").trim();
+  if (expectedSkillId && body?.session?.skill_id !== expectedSkillId) {
+    console.warn("Rejected request from an unknown skill_id.");
+    return res.status(403).json({ error: "Forbidden" });
+  }
+
+  // Yandex Dialogs health checks send "ping"; answer without calling paid APIs.
+  if (String(body?.request?.original_utterance || "").trim().toLowerCase() === "ping") {
+    return res.status(200).json(aliceResponse("pong", false, body?.state?.session?.history));
+  }
+
   const text = String(body?.request?.command || body?.request?.original_utterance || "").trim();
   const oldHistory = safeHistory(body?.state?.session?.history);
 
@@ -240,10 +263,10 @@ export default async function handler(req, res) {
 
     return res.status(200).json(aliceResponse(answer, false, history));
   } catch (error) {
-    const safeError = error?.message === "AbortError" ? "TIME_BUDGET_EXHAUSTED" : error;
+    const safeError = error?.name === "AbortError" ? new Error("TIME_BUDGET_EXHAUSTED") : error;
     console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
     return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory));
   }
 }
 
-export { aliceResponse, fitAliceText, isSearchIntent, safeHistory };
+export { aliceResponse, errorForUser, fitAliceText, fitHistoryToBytes, isSearchIntent, safeHistory };
