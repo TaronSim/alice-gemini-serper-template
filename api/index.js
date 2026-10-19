@@ -5,7 +5,7 @@ const MAX_HISTORY_MESSAGE_CHARS = 300;
 const MAX_SESSION_STATE_BYTES = 900;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 4000;
-const SERPER_TIMEOUT_MS = 600;
+const SERPER_TIMEOUT_MS = 1800;
 const GEMINI_TIMEOUT_MS = 3300;
 
 const SYSTEM_PROMPT = [
@@ -245,7 +245,7 @@ export default async function handler(req, res) {
     let searchContext = "";
     if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
       // Search has a very short budget because Alice expects a response within 4.5 seconds.
-      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
+      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2100)));
     }
 
     const answer = await askGemini(
