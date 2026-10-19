@@ -5,22 +5,49 @@ const DEFAULT_MODEL = "gemini-3.8-flash";
 // Used when the main model is out of quota (HTTP 429), e.g. when it has no free-tier limit.
 const DEFAULT_FALLBACK_MODEL = "gemini-3.5-flash-lite";
 const SERPER_TIMEOUT_MS = 5000;
-const MAX_SEARCH_ROUNDS = 2;
+const MAX_TOOL_ROUNDS = 3;
+const SPORTS_LOOKAHEAD_DAYS = 7;
 // When the main model is slow, it is cut off early enough for the fallback model to answer.
 const FALLBACK_RESERVE_MS = 9000;
 // Errors after which the next model is tried: out of quota, overloaded, or too slow.
 const RETRYABLE_ERRORS = new Set(["GEMINI_QUOTA", "GEMINI_UNAVAILABLE", "TIME_BUDGET_EXHAUSTED"]);
-// Gemini decides itself when to search, like with the built-in Google Search, but the search runs through Serper.
-const SEARCH_TOOL = {
-  functionDeclarations: [{
-    name: "search_web",
-    description: "Поиск Google. Используй для вопросов о свежих событиях, спорте, расписаниях, новостях, погоде, ценах, курсах и для фактов, в которых не уверен. Пиши в запросе конкретную дату вместо слов «сегодня» или «завтра».",
-    parameters: {
-      type: "object",
-      properties: { query: { type: "string", description: "Поисковый запрос" } },
-      required: ["query"]
-    }
-  }]
+// Leagues with full fixture lists in ESPN's free public scoreboard.
+const FOOTBALL_LEAGUES = {
+  "uefa.champions": "Лига чемпионов",
+  "uefa.europa": "Лига Европы",
+  "uefa.europa.conf": "Лига конференций",
+  "eng.1": "Английская Премьер-лига",
+  "esp.1": "Ла Лига",
+  "ita.1": "Серия А",
+  "ger.1": "Бундеслига",
+  "fra.1": "Лига 1",
+  "rus.1": "РПЛ"
+};
+// Functions Gemini may call; it decides itself when to use them, like the Gemini app decides when to search.
+const SEARCH_DECLARATION = {
+  name: "search_web",
+  description: "Поиск Google. Используй для вопросов о свежих событиях, новостях, погоде, ценах, курсах и для фактов, в которых не уверен. Пиши в запросе конкретную дату вместо слов «сегодня» или «завтра». Если результаты неполные, поищи ещё раз точнее, например на английском.",
+  parameters: {
+    type: "object",
+    properties: { query: { type: "string", description: "Поисковый запрос" } },
+    required: ["query"]
+  }
+};
+const FOOTBALL_DECLARATION = {
+  name: "football_matches",
+  description: "Полный и точный список футбольных матчей турнира на дату: время начала в часовом поясе пользователя, счёт идущих и завершённых игр. Если в этот день матчей нет, возвращает ближайший игровой день. Для матчей этих турниров используй эту функцию, а не поиск.",
+  parameters: {
+    type: "object",
+    properties: {
+      league: {
+        type: "string",
+        enum: Object.keys(FOOTBALL_LEAGUES),
+        description: Object.entries(FOOTBALL_LEAGUES).map(([slug, name]) => `${slug} — ${name}`).join(", ")
+      },
+      date: { type: "string", description: "Дата в формате ГГГГ-ММ-ДД по часовому поясу пользователя" }
+    },
+    required: ["league", "date"]
+  }
 };
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 300;
@@ -58,7 +85,8 @@ function systemPrompt(now = new Date(), timeZone = DEFAULT_TIME_ZONE) {
     "Ты — Gemini, ассистент Google. Пользователь говорит с тобой голосом через Яндекс Алису, и твой ответ будет зачитан вслух.",
     "Отвечай так же точно и по существу, как ответил бы в обычном чате Gemini, но в виде устной речи: без Markdown, заголовков, таблиц, ссылок, эмодзи и списков с символами. Перечисления делай обычными предложениями.",
     "Укладывайся примерно в 900 символов. Если тема большая, расскажи главное и предложи продолжить.",
-    "Для вопросов о свежих событиях, спорте, расписаниях, новостях, погоде, ценах и курсах обязательно используй поиск Google.",
+    "Для вопросов о свежих событиях, спорте, расписаниях, новостях, погоде, ценах и курсах обязательно используй поиск или спортивную базу, если они доступны.",
+    "Не утверждай, что матча, события или факта нет, если инструменты прямо этого не подтвердили. Если точных данных не нашлось, так и скажи.",
     `Сейчас ${date}, часовой пояс пользователя ${zone}. Время называй в этом поясе.`,
     "Отвечай на языке пользователя."
   ].join(" ");
@@ -327,9 +355,79 @@ async function searchWeb(query, timeoutMs) {
   }
 }
 
+async function fetchFootballDay(slug, day, timeoutMs) {
+  const stamp = day.toISOString().slice(0, 10).replace(/-/g, "");
+  const { response, data } = await fetchJson(
+    `https://site.api.espn.com/apis/site/v2/sports/soccer/${slug}/scoreboard?dates=${stamp}`,
+    { headers: { Accept: "application/json" } },
+    timeoutMs
+  );
+  if (!response.ok) throw new Error(`ESPN_HTTP_${response.status}`);
+  return Array.isArray(data?.events) ? data.events : [];
+}
+
+function formatMatch(event, timeZone) {
+  const competitors = event?.competitions?.[0]?.competitors || [];
+  const home = competitors.find(item => item?.homeAway === "home") || competitors[0];
+  const away = competitors.find(item => item?.homeAway === "away") || competitors[1];
+  const teams = `${home?.team?.displayName || "?"} — ${away?.team?.displayName || "?"}`;
+  const status = event?.status?.type || {};
+  const score = `${home?.score ?? 0}:${away?.score ?? 0}`;
+  if (/POSTPONED|CANCELED/i.test(status.name || "")) return `${teams} (перенесён)`;
+  if (status.state === "post") return `${teams} ${score} (завершён)`;
+  if (status.state === "in") return `${teams} ${score} (идёт, ${clipText(status.shortDetail, 20)})`;
+  const time = new Intl.DateTimeFormat("ru-RU", { timeZone, hour: "2-digit", minute: "2-digit" }).format(new Date(event.date));
+  return `${time} ${teams}`;
+}
+
+function formatDay(day) {
+  return new Intl.DateTimeFormat("ru-RU", { timeZone: "UTC", day: "numeric", month: "long", year: "numeric" }).format(day);
+}
+
+// Runs the football_matches function: the whole matchday, or the nearest one within a week.
+async function footballMatches(league, date, timeZone, timeoutMs) {
+  const name = FOOTBALL_LEAGUES[league];
+  if (!name || !/^\d{4}-\d{2}-\d{2}$/.test(String(date))) return "Неизвестный турнир или дата.";
+  if (timeoutMs < 300) return "Спортивная база не успела ответить.";
+  console.info(`Gemini asked for football matches: ${league} ${date}`);
+
+  const zone = resolveTimeZone(timeZone);
+  const deadline = Date.now() + timeoutMs;
+  const day = new Date(`${date}T12:00:00Z`);
+  try {
+    let events = await fetchFootballDay(league, day, timeoutMs);
+    let shownDay = day;
+    if (!events.length) {
+      const days = Array.from({ length: SPORTS_LOOKAHEAD_DAYS }, (_, i) => new Date(day.getTime() + (i + 1) * 86400000));
+      const lists = await Promise.all(days.map(item => fetchFootballDay(league, item, deadline - Date.now()).catch(() => [])));
+      const index = lists.findIndex(list => list.length);
+      if (index >= 0) {
+        events = lists[index];
+        shownDay = days[index];
+      }
+    }
+
+    const header = `Спортивная база ESPN, полный список. Турнир: ${name}. Время указано для пояса ${zone}.`;
+    if (!events.length) return `${header} На ${formatDay(day)} и следующие ${SPORTS_LOOKAHEAD_DAYS} дней матчей нет.`;
+    const intro = shownDay === day
+      ? `Матчи ${formatDay(day)} (${events.length}):`
+      : `На ${formatDay(day)} матчей нет. Ближайшие матчи ${formatDay(shownDay)} (${events.length}):`;
+    return `${header} ${intro} ${events.map(event => formatMatch(event, zone)).join("; ")}.`;
+  } catch (error) {
+    console.warn("ESPN request failed:", error?.message || "unknown error");
+    return "Спортивная база недоступна. Попробуй поиск.";
+  }
+}
+
+function runTool(call, timeZone, timeoutMs) {
+  if (call?.name === "search_web") return searchWeb(call?.args?.query, timeoutMs);
+  if (call?.name === "football_matches") return footballMatches(call?.args?.league, call?.args?.date, timeZone, timeoutMs);
+  return Promise.resolve("Неизвестная функция.");
+}
+
 function searchLabel(search) {
   if (search === "google") return "with Google Search";
-  if (search === "serper") return "with Serper search";
+  if (search === "tools") return "with search tools";
   return "without search";
 }
 
@@ -340,7 +438,7 @@ async function askGemini(text, history, { now, timeZone, timeoutMs, allowPartial
   const model = modelName(process.env.GEMINI_MODEL, DEFAULT_MODEL);
   const fallback = modelName(process.env.GEMINI_FALLBACK_MODEL, DEFAULT_FALLBACK_MODEL);
   const setting = String(process.env.GEMINI_GOOGLE_SEARCH || "").trim().toLowerCase();
-  const webSearch = setting !== "off" && process.env.SERPER_API_KEY ? "serper" : "none";
+  const webSearch = setting === "off" ? "none" : "tools";
   const attempts = setting === "on"
     ? [{ model, search: "google" }, { model, search: webSearch }, { model: fallback, search: webSearch }]
     : [{ model, search: webSearch }, { model: fallback, search: webSearch }];
@@ -446,10 +544,11 @@ async function askGeminiModel(model, text, history, { now, timeZone, timeoutMs, 
       generationConfig: generationConfigFor(model)
     };
     if (search === "google") request.tools = [{ google_search: {} }];
-    if (search === "serper") {
-      request.tools = [SEARCH_TOOL];
-      // After enough searches Gemini must answer with what it found.
-      if (round >= MAX_SEARCH_ROUNDS) request.toolConfig = { functionCallingConfig: { mode: "NONE" } };
+    if (search === "tools") {
+      const declarations = process.env.SERPER_API_KEY ? [SEARCH_DECLARATION, FOOTBALL_DECLARATION] : [FOOTBALL_DECLARATION];
+      request.tools = [{ functionDeclarations: declarations }];
+      // After enough lookups Gemini must answer with what it found.
+      if (round >= MAX_TOOL_ROUNDS) request.toolConfig = { functionCallingConfig: { mode: "NONE" } };
     }
 
     const step = await streamGemini(model, request, deadline - Date.now(), search);
@@ -461,9 +560,8 @@ async function askGeminiModel(model, text, history, { now, timeZone, timeoutMs, 
       return partial;
     }
 
-    if (search === "serper" && step.calls.length && round < MAX_SEARCH_ROUNDS) {
-      const results = await Promise.all(step.calls.map(call =>
-        call?.name === "search_web" ? searchWeb(call?.args?.query, deadline - Date.now() - 1500) : "Неизвестная функция."));
+    if (search === "tools" && step.calls.length && round < MAX_TOOL_ROUNDS) {
+      const results = await Promise.all(step.calls.map(call => runTool(call, timeZone, deadline - Date.now() - 1500)));
       contents.push({ role: "model", parts: step.parts });
       contents.push({
         role: "user",
@@ -664,4 +762,4 @@ export default async function handler(req, res) {
   }
 }
 
-export { aliceResponse, completeSentences, errorForUser, fitAliceText, fitHistoryToBytes, generationConfigFor, isContinueCommand, safeHistory, systemPrompt, toSpeech };
+export { aliceResponse, completeSentences, errorForUser, fitAliceText, footballMatches, fitHistoryToBytes, generationConfigFor, isContinueCommand, safeHistory, systemPrompt, toSpeech };

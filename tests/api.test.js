@@ -261,7 +261,8 @@ test("Gemini gets Google Search when enabled, the current date and the user's ti
 test("the system prompt keeps only voice-format limits", () => {
   const prompt = systemPrompt(new Date("2026-10-19T12:00:00Z"), "Europe/Moscow");
   assert.match(prompt, /19 октября 2026/);
-  assert.match(prompt, /поиск Google/);
+  assert.match(prompt, /спортивную базу/);
+  assert.match(prompt, /Не утверждай, что матча/);
   assert.doesNotMatch(prompt, /1–3 коротких/);
 });
 
@@ -297,7 +298,7 @@ test("when Google Search is out of quota, Gemini answers without it and then via
   const attempts = [];
   globalThis.fetch = async (url, options) => {
     const model = String(url).match(/models\/([^:]+):/)[1];
-    const search = Boolean(JSON.parse(options.body).tools);
+    const search = JSON.stringify(JSON.parse(options.body).tools || []).includes("google_search");
     attempts.push(`${model}${search ? "+search" : ""}`);
     if (search || model === "gemini-3.8-flash") {
       return new Response(JSON.stringify({ error: { message: "You exceeded your current quota" } }), { status: 429 });
@@ -373,6 +374,54 @@ test("an overloaded main model (HTTP 503) falls back to the light model", async 
     await handler({ method: "POST", body: { request: { command: "сочини короткий стих" } } }, res);
     assert.deepEqual(models, ["gemini-3.8-flash", "gemini-3.5-flash-lite"]);
     assert.equal(res.payload.response.text, "Стих от запасной модели.");
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete process.env.GEMINI_API_KEY;
+  }
+});
+
+test("Gemini can ask the sports feed for a full matchday in the user's time zone", async () => {
+  const handler = (await import("../api/index.js")).default;
+  const originalFetch = globalThis.fetch;
+  process.env.GEMINI_API_KEY = "gemini-key";
+  let espnUrl = "";
+  let toolResult = "";
+  let calls = 0;
+  globalThis.fetch = async (url, options) => {
+    if (String(url).includes("espn")) {
+      espnUrl = String(url);
+      const match = (home, away) => ({
+        date: "2026-10-20T19:00Z",
+        status: { type: { name: "STATUS_SCHEDULED", state: "pre" } },
+        competitions: [{ competitors: [
+          { homeAway: "home", score: "0", team: { displayName: home } },
+          { homeAway: "away", score: "0", team: { displayName: away } }
+        ] }]
+      });
+      return new Response(JSON.stringify({ events: [match("Liverpool", "Villarreal"), match("Napoli", "Bodo/Glimt")] }));
+    }
+    calls += 1;
+    const request = JSON.parse(options.body);
+    if (calls === 1) {
+      const names = request.tools[0].functionDeclarations.map(item => item.name);
+      assert.deepEqual(names, ["football_matches"]);
+      const call = { candidates: [{ content: { role: "model", parts: [{
+        functionCall: { name: "football_matches", args: { league: "uefa.champions", date: "2026-10-20" } }
+      }] } }] };
+      return new Response(`data: ${JSON.stringify(call)}\n\n`);
+    }
+    toolResult = request.contents.at(-1).parts[0].functionResponse.response.result;
+    return geminiSse("Завтра Ливерпуль сыграет с Вильярреалом, а Наполи с Будё-Глимт, оба матча в 22:00.");
+  };
+  try {
+    const res = fakeRes();
+    await handler({
+      method: "POST",
+      body: { meta: { timezone: "Europe/Moscow" }, request: { command: "какие есть матчи лиги чемпионов завтра" } }
+    }, res);
+    assert.match(espnUrl, /uefa\.champions\/scoreboard\?dates=20261020$/);
+    assert.match(toolResult, /22:00 Liverpool — Villarreal; 22:00 Napoli — Bodo\/Glimt/);
+    assert.match(res.payload.response.text, /Ливерпуль/);
   } finally {
     globalThis.fetch = originalFetch;
     delete process.env.GEMINI_API_KEY;
