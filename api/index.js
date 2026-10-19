@@ -4,16 +4,17 @@ const MAX_HISTORY_MESSAGE_CHARS = 300;
 // Yandex rejects responses whose session_state JSON exceeds 1 KB; keep a safety margin.
 const MAX_SESSION_STATE_BYTES = 900;
 const MAX_ALICE_TEXT = 1024;
-const TOTAL_RESPONSE_BUDGET_MS = 4000;
+const TOTAL_RESPONSE_BUDGET_MS = 4400;
 const SERPER_TIMEOUT_MS = 1800;
-const GEMINI_TIMEOUT_MS = 3300;
+const GEMINI_TIMEOUT_MS = 4100;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
   "Отвечай естественно, по-русски, кратко и так, чтобы ответ было удобно слушать.",
   "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления.",
-  "Если вопрос требует актуальных данных и переданы результаты поиска, опирайся на них; не выдумывай отсутствующие факты.",
-  "Если не знаешь ответа, честно скажи об этом."
+  "Если переданы результаты поиска, отвечай по ним. Для расписания и результатов назови найденные матчи: кто играет, во сколько и с каким счётом.",
+  "Не говори, что данных нет, если в тексте уже есть команды, время или счёт. Не выдумывай факты, которых в результатах нет.",
+  "Если не знаешь ответа и поиск ничего не дал, честно скажи об этом."
 ].join(" ");
 
 function aliceResponse(text, endSession = false, history = []) {
@@ -56,7 +57,58 @@ function fitAliceText(value) {
 }
 
 function isSearchIntent(text) {
-  return /\b(latest|today|current|news|weather|price|exchange rate|recent|search|look up)\b|сегодня|сейчас|последн|новост|погод|курс валют|найди|поищи|актуальн|сколько стоит|свежие данные/i.test(text);
+  return /\b(latest|today|current|news|weather|price|exchange rate|recent|search|look up)\b|сегодня|сейчас|завтра|последн|новост|погод|курс валют|найди|поищи|актуальн|сколько стоит|свежие данные|матч|расписан|результат|чемпионат/i.test(text);
+}
+
+// Turns a spoken question into a shorter web query. Schedule questions get an extra keyword.
+function searchQuery(text) {
+  const query = String(text ?? "").replace(/\s+/g, " ").trim().slice(0, 180);
+  if (/матч|чемпионат|лиг|расписан|результат|сч[её]т/i.test(query) && !/расписан/i.test(query)) {
+    return `${query} расписание`;
+  }
+  return query;
+}
+
+function clipText(value, max) {
+  return String(value ?? "").replace(/\s+/g, " ").trim().slice(0, max);
+}
+
+// Collects the parts of a Serper response that can actually contain facts, not only three short snippets.
+function formatSearchContext(data) {
+  const lines = [];
+  const box = data?.answerBox;
+  const answer = box?.answer || box?.snippet;
+  if (answer) lines.push(`Краткий ответ: ${clipText(answer, 500)}`);
+
+  if (Array.isArray(box?.list)) {
+    const list = box.list
+      .map(item => clipText(typeof item === "string" ? item : item?.title || item?.snippet, 140))
+      .filter(Boolean)
+      .slice(0, 8);
+    if (list.length) lines.push(`Список: ${list.join("; ")}`);
+  }
+
+  const graph = data?.knowledgeGraph;
+  if (graph?.title || graph?.description) {
+    const attrs = graph.attributes && typeof graph.attributes === "object"
+      ? Object.entries(graph.attributes).slice(0, 8).map(([key, value]) => `${key}: ${clipText(value, 80)}`).join("; ")
+      : "";
+    lines.push(`Карточка: ${clipText(graph.title, 120)}. ${clipText(graph.description, 300)}${attrs ? ` ${attrs}` : ""}`.trim());
+  }
+
+  const sports = data?.sportsResults || data?.sports_results;
+  if (sports) lines.push(`Спорт: ${clipText(JSON.stringify(sports), 900)}`);
+
+  for (const item of (Array.isArray(data?.organic) ? data.organic : []).slice(0, 6)) {
+    const snippet = clipText(item?.snippet, 320);
+    if (snippet) lines.push(`${clipText(item?.title, 140)}: ${snippet}`);
+  }
+
+  for (const item of (Array.isArray(data?.peopleAlsoAsk) ? data.peopleAlsoAsk : []).slice(0, 2)) {
+    if (item?.snippet) lines.push(`Ещё: ${clipText(item.question, 80)} ${clipText(item.snippet, 220)}`);
+  }
+
+  return lines.join("\n").slice(0, 2200);
 }
 
 function safeHistory(history) {
@@ -92,7 +144,7 @@ async function searchWeb(query, timeoutMs) {
           "X-API-KEY": key,
           "Content-Type": "application/json"
         },
-        body: JSON.stringify({ q: query, gl: "ru", hl: "ru", num: 3 })
+        body: JSON.stringify({ q: searchQuery(query), gl: "ru", hl: "ru", num: 8 })
       },
       Math.min(SERPER_TIMEOUT_MS, timeoutMs)
     );
@@ -102,18 +154,7 @@ async function searchWeb(query, timeoutMs) {
       return "";
     }
 
-    const items = (Array.isArray(data.organic) ? data.organic : [])
-      .slice(0, 3)
-      .map((item, i) => {
-        const title = String(item.title || "").slice(0, 180);
-        const snippet = String(item.snippet || "").slice(0, 350);
-        const link = String(item.link || "").slice(0, 240);
-        return `${i + 1}. ${title}: ${snippet} ${link}`.trim();
-      });
-
-    const answerBox = data.answerBox?.answer || data.answerBox?.snippet;
-    if (answerBox) items.unshift(`Краткий ответ поисковика: ${String(answerBox).slice(0, 350)}`);
-    return items.length ? items.join("\n") : "";
+    return formatSearchContext(data);
   } catch (error) {
     console.warn("Serper request did not finish in time; continuing without search.");
     return "";
@@ -134,7 +175,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   }));
 
   const prompt = searchContext
-    ? `${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их только там, где они относятся к вопросу.`
+    ? `${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nНазови команды, время и счёт, если они есть в тексте. Не выдумывай матчи, которых там нет.`
     : text;
   contents.push({ role: "user", parts: [{ text: prompt }] });
 
@@ -245,14 +286,15 @@ export default async function handler(req, res) {
     let searchContext = "";
     if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
       // Search has a very short budget because Alice expects a response within 4.5 seconds.
-      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2100)));
+      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2300)));
+      console.info(searchContext ? `Search context attached, ${searchContext.length} chars` : "Search returned no usable text");
     }
 
     const answer = await askGemini(
       text,
       oldHistory,
       searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600))
+      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 250))
     );
 
     const history = [
@@ -269,4 +311,4 @@ export default async function handler(req, res) {
   }
 }
 
-export { aliceResponse, errorForUser, fitAliceText, fitHistoryToBytes, isSearchIntent, safeHistory };
+export { aliceResponse, errorForUser, fitAliceText, fitHistoryToBytes, formatSearchContext, isSearchIntent, safeHistory, searchQuery };

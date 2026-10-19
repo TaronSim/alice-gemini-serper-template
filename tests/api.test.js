@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { aliceResponse, errorForUser, fitAliceText, fitHistoryToBytes, isSearchIntent, safeHistory } from "../api/index.js";
+import { aliceResponse, errorForUser, fitAliceText, fitHistoryToBytes, formatSearchContext, isSearchIntent, safeHistory, searchQuery } from "../api/index.js";
 
 test("Alice response uses required response envelope", () => {
   const result = aliceResponse("Привет", false, [{ role: "user", text: "тест" }]);
@@ -13,7 +13,22 @@ test("Alice response uses required response envelope", () => {
 test("search intent detects Russian and English freshness requests", () => {
   assert.equal(isSearchIntent("Какая погода сегодня?"), true);
   assert.equal(isSearchIntent("What is the latest news?"), true);
+  assert.equal(isSearchIntent("матчи лиги чемпионов завтра"), true);
+  assert.equal(isSearchIntent("какие матчи чемпионата англии сегодня"), true);
   assert.equal(isSearchIntent("Расскажи сказку"), false);
+  assert.equal(isSearchIntent("сочини короткий стих"), false);
+});
+
+test("schedule questions become a search query and Serper facts are kept", () => {
+  assert.equal(searchQuery("какие матчи чемпионата англии сегодня"), "какие матчи чемпионата англии сегодня расписание");
+  assert.equal(searchQuery("сочини короткий стих"), "сочини короткий стих");
+
+  const context = formatSearchContext({
+    answerBox: { snippet: "Арсенал — Челси, 17:30" },
+    organic: [{ title: "АПЛ сегодня", snippet: "Ливерпуль — Манчестер Сити, 20:00" }]
+  });
+  assert.match(context, /Арсенал — Челси, 17:30/);
+  assert.match(context, /Ливерпуль — Манчестер Сити, 20:00/);
 });
 
 test("long responses are cut at a natural boundary and stay within Alice limit", () => {
