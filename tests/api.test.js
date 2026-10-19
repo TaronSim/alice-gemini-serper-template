@@ -287,3 +287,26 @@ test("an out-of-quota model falls back to the lighter model", async () => {
     delete process.env.GEMINI_API_KEY;
   }
 });
+
+test("when every model with Google Search is out of quota, the light model answers without search", async () => {
+  const handler = (await import("../api/index.js")).default;
+  const originalFetch = globalThis.fetch;
+  process.env.GEMINI_API_KEY = "gemini-key";
+  const attempts = [];
+  globalThis.fetch = async (url, options) => {
+    const model = String(url).match(/models\/([^:]+):/)[1];
+    const search = Boolean(JSON.parse(options.body).tools);
+    attempts.push(`${model}${search ? "+search" : ""}`);
+    if (search) return new Response(JSON.stringify({ error: { message: "You exceeded your current quota" } }), { status: 429 });
+    return geminiSse("Стих без поиска.");
+  };
+  try {
+    const res = fakeRes();
+    await handler({ method: "POST", body: { request: { command: "сочини короткий стих" } } }, res);
+    assert.deepEqual(attempts, ["gemini-3.8-flash+search", "gemini-3.5-flash-lite+search", "gemini-3.5-flash-lite"]);
+    assert.equal(res.payload.response.text, "Стих без поиска.");
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete process.env.GEMINI_API_KEY;
+  }
+});

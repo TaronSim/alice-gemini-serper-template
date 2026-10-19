@@ -235,26 +235,36 @@ function modelName(value, fallback) {
   return model;
 }
 
-// Asks the main model and switches to the fallback model once if the main one is out of quota.
+// Tries the main model with Google Search, then the fallback model with search, then the fallback model without it.
+// Each step runs only when the previous one is out of quota (HTTP 429).
 async function askGemini(text, history, { now, timeZone, timeoutMs, allowPartial }) {
   const deadline = Date.now() + timeoutMs;
   const model = modelName(process.env.GEMINI_MODEL, DEFAULT_MODEL);
-  const fallback = String(process.env.GEMINI_FALLBACK_MODEL ?? DEFAULT_FALLBACK_MODEL).trim();
-  try {
-    return await askGeminiModel(model, text, history, { now, timeZone, timeoutMs, allowPartial });
-  } catch (error) {
-    if (error?.message !== "GEMINI_QUOTA" || !fallback || fallback === model) throw error;
-    console.warn(`Gemini model ${model} is out of quota; retrying with ${fallback}.`);
-    return askGeminiModel(modelName(fallback), text, history, {
-      now,
-      timeZone,
-      timeoutMs: deadline - Date.now(),
-      allowPartial
-    });
+  const fallback = modelName(process.env.GEMINI_FALLBACK_MODEL, DEFAULT_FALLBACK_MODEL);
+  const search = String(process.env.GEMINI_GOOGLE_SEARCH || "").trim().toLowerCase() !== "off";
+  const attempts = [{ model, search }];
+  if (fallback !== model) attempts.push({ model: fallback, search });
+  if (search) attempts.push({ model: fallback, search: false });
+
+  for (const [index, attempt] of attempts.entries()) {
+    try {
+      return await askGeminiModel(attempt.model, text, history, {
+        now,
+        timeZone,
+        timeoutMs: deadline - Date.now(),
+        allowPartial,
+        search: attempt.search
+      });
+    } catch (error) {
+      const next = attempts[index + 1];
+      if (error?.message !== "GEMINI_QUOTA" || !next) throw error;
+      console.warn(`Gemini ${attempt.model}${attempt.search ? " with Google Search" : ""} is out of quota; retrying with ${next.model}${next.search ? " with Google Search" : " without Google Search"}.`);
+    }
   }
+  throw new Error("GEMINI_QUOTA");
 }
 
-async function askGeminiModel(model, text, history, { now, timeZone, timeoutMs, allowPartial }) {
+async function askGeminiModel(model, text, history, { now, timeZone, timeoutMs, allowPartial, search }) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error("MISSING_GEMINI_KEY");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
@@ -271,9 +281,7 @@ async function askGeminiModel(model, text, history, { now, timeZone, timeoutMs, 
     generationConfig: generationConfigFor(model)
   };
   // Grounding with Google Search: Gemini decides itself what to look up, as in the Gemini app.
-  if (String(process.env.GEMINI_GOOGLE_SEARCH || "").trim().toLowerCase() !== "off") {
-    request.tools = [{ google_search: {} }];
-  }
+  if (search) request.tools = [{ google_search: {} }];
 
   // Streaming lets us keep the sentences Gemini has already written when time runs out.
   const controller = new AbortController();
@@ -307,7 +315,8 @@ async function askGeminiModel(model, text, history, { now, timeZone, timeoutMs, 
         .map(item => item?.quotaId || item?.quotaMetric)
         .filter(Boolean)
         .join(", ");
-      console.error("Gemini request failed with HTTP", status, model, detail, quotas ? `Quota: ${quotas}` : "");
+      console.error("Gemini request failed with HTTP", status, model, search ? "with Google Search" : "without Google Search", detail, quotas ? `Quota: ${quotas}` : "");
+      if (status === 429) console.error("Gemini 429 details:", JSON.stringify(data?.error?.details || data?.error || {}).slice(0, 1500));
       if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
       if (status === 429) throw new Error("GEMINI_QUOTA");
       throw new Error("GEMINI_REQUEST_FAILED");
