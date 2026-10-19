@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { aliceResponse, dateContext, errorForUser, fitAliceText, fitHistoryToBytes, formatSearchContext, generationConfigFor, isSearchIntent, safeHistory, searchQuery } from "../api/index.js";
+import { aliceResponse, completeSentences, dateContext, errorForUser, fitAliceText, fitHistoryToBytes, formatSearchContext, generationConfigFor, isContinueCommand, isSearchIntent, safeHistory, searchQuery } from "../api/index.js";
 
 test("Alice response uses required response envelope", () => {
   const result = aliceResponse("Привет", false, [{ role: "user", text: "тест" }]);
@@ -188,5 +188,131 @@ test("Gemini timeout produces the 'не успела' message", async () => {
   } finally {
     globalThis.fetch = originalFetch;
     delete process.env.GEMINI_API_KEY;
+  }
+});
+
+function geminiSse(text) {
+  const event = { candidates: [{ content: { parts: [{ text }] }, finishReason: "STOP" }] };
+  return new Response(`data: ${JSON.stringify(event)}\r\n\r\n`, {
+    status: 200,
+    headers: { "Content-Type": "text/event-stream" }
+  });
+}
+
+// Never answers until the request is aborted, like a stuck network call.
+function hangUntilAborted(signal) {
+  return new Promise((_, reject) => {
+    signal.addEventListener("abort", () => reject(new DOMException("This operation was aborted", "AbortError")));
+  });
+}
+
+test("only whole sentences are kept and continue phrases are recognised", () => {
+  assert.equal(completeSentences("Первое предложение. Второе без конца"), "Первое предложение.");
+  assert.equal(completeSentences("Без точки"), "");
+  assert.equal(isContinueCommand("Дальше!"), true);
+  assert.equal(isContinueCommand("ну что там?"), true);
+  assert.equal(isContinueCommand("дальше расскажи про Марс"), false);
+});
+
+test("slow Gemini stream returns the sentences it already finished", async () => {
+  const handler = (await import("../api/index.js")).default;
+  const originalFetch = globalThis.fetch;
+  process.env.GEMINI_API_KEY = "test-key";
+  globalThis.fetch = async (url, options) => {
+    assert.match(String(url), /streamGenerateContent\?alt=sse/);
+    const first = { candidates: [{ content: { parts: [{ text: "Жил-был кот. Однажды он" }] } }] };
+    const body = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(first)}\n\n`));
+        options.signal.addEventListener("abort", () => controller.error(new DOMException("aborted", "AbortError")));
+      }
+    });
+    return new Response(body, { status: 200 });
+  };
+  try {
+    const res = fakeRes();
+    await handler({ method: "POST", body: { request: { command: "расскажи сказку" } } }, res);
+    assert.equal(res.payload.response.text, "Жил-был кот.");
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete process.env.GEMINI_API_KEY;
+  }
+});
+
+test("a slow Serper request is repeated and the faster copy is used", async () => {
+  const handler = (await import("../api/index.js")).default;
+  const originalFetch = globalThis.fetch;
+  process.env.SERPER_API_KEY = "serper-key";
+  process.env.GEMINI_API_KEY = "gemini-key";
+  let serperCalls = 0;
+  let geminiPrompt = "";
+  globalThis.fetch = async (url, options) => {
+    if (String(url).includes("serper")) {
+      serperCalls += 1;
+      if (serperCalls === 1) return hangUntilAborted(options.signal);
+      return new Response(JSON.stringify({ organic: [{ title: "АПЛ", snippet: "Арсенал — Челси, 19:30" }] }));
+    }
+    geminiPrompt = JSON.stringify(JSON.parse(options.body).contents);
+    return geminiSse("Сегодня Арсенал играет с Челси в 19:30.");
+  };
+  try {
+    const res = fakeRes();
+    await handler({ method: "POST", body: { request: { command: "какие матчи чемпионата англии на этой неделе" } } }, res);
+    assert.equal(serperCalls, 2);
+    assert.match(geminiPrompt, /Арсенал — Челси, 19:30/);
+    assert.equal(res.payload.response.text, "Сегодня Арсенал играет с Челси в 19:30.");
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete process.env.SERPER_API_KEY;
+    delete process.env.GEMINI_API_KEY;
+  }
+});
+
+test("with Redis a late answer is finished in the background and given on 'дальше'", async () => {
+  const handler = (await import("../api/index.js")).default;
+  const originalFetch = globalThis.fetch;
+  const store = new Map();
+  let releaseGemini;
+  const geminiGate = new Promise(resolve => { releaseGemini = resolve; });
+  process.env.GEMINI_API_KEY = "gemini-key";
+  process.env.UPSTASH_REDIS_REST_URL = "https://redis.test";
+  process.env.UPSTASH_REDIS_REST_TOKEN = "redis-token";
+  globalThis.fetch = async (url, options) => {
+    if (String(url).startsWith("https://redis.test")) {
+      const [command, key, value] = JSON.parse(options.body);
+      let result = null;
+      if (command === "GET") result = store.get(key) ?? null;
+      if (command === "SET") { store.set(key, value); result = "OK"; }
+      if (command === "DEL") result = store.delete(key) ? 1 : 0;
+      return new Response(JSON.stringify({ result }));
+    }
+    await geminiGate;
+    return geminiSse("Жил-был кот, и он любил молоко.");
+  };
+  const session = { session_id: "session-1" };
+  try {
+    const first = fakeRes();
+    await handler({ method: "POST", body: { session, request: { command: "расскажи сказку" } } }, first);
+    assert.match(first.payload.response.text, /Скажите «дальше»/);
+
+    releaseGemini();
+    for (let i = 0; i < 50 && !String(store.get("alice:pending:session-1")).includes('"done"'); i += 1) {
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+
+    const next = fakeRes();
+    await handler({ method: "POST", body: { session, request: { command: "дальше" } } }, next);
+    assert.equal(next.payload.response.text, "Жил-был кот, и он любил молоко.");
+    assert.deepEqual(next.payload.session_state.history.map(item => item.text), [
+      "расскажи сказку",
+      "Жил-был кот, и он любил молоко."
+    ]);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(store.has("alice:pending:session-1"), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete process.env.GEMINI_API_KEY;
+    delete process.env.UPSTASH_REDIS_REST_URL;
+    delete process.env.UPSTASH_REDIS_REST_TOKEN;
   }
 });
