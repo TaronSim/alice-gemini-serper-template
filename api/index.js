@@ -6,6 +6,10 @@ const DEFAULT_MODEL = "gemini-3.8-flash";
 const DEFAULT_FALLBACK_MODEL = "gemini-3.5-flash-lite";
 const SERPER_TIMEOUT_MS = 5000;
 const MAX_SEARCH_ROUNDS = 2;
+// When the main model is slow, it is cut off early enough for the fallback model to answer.
+const FALLBACK_RESERVE_MS = 9000;
+// Errors after which the next model is tried: out of quota, overloaded, or too slow.
+const RETRYABLE_ERRORS = new Set(["GEMINI_QUOTA", "GEMINI_UNAVAILABLE", "TIME_BUDGET_EXHAUSTED"]);
 // Gemini decides itself when to search, like with the built-in Google Search, but the search runs through Serper.
 const SEARCH_TOOL = {
   functionDeclarations: [{
@@ -344,21 +348,24 @@ async function askGemini(text, history, { now, timeZone, timeoutMs, allowPartial
     attempts.findIndex(other => other.model === item.model && other.search === item.search) === index);
 
   for (const [index, attempt] of unique.entries()) {
+    const next = unique[index + 1];
+    const left = deadline - Date.now();
+    const reserve = next && left >= 2 * FALLBACK_RESERVE_MS ? FALLBACK_RESERVE_MS : 0;
     try {
       return await askGeminiModel(attempt.model, text, history, {
         now,
         timeZone,
-        timeoutMs: deadline - Date.now(),
-        allowPartial,
+        timeoutMs: left - reserve,
+        allowPartial: allowPartial && !reserve,
         search: attempt.search
       });
     } catch (error) {
-      const next = unique[index + 1];
-      if (error?.message !== "GEMINI_QUOTA" || !next) throw error;
-      console.warn(`Gemini ${attempt.model} ${searchLabel(attempt.search)} is out of quota; retrying with ${next.model} ${searchLabel(next.search)}.`);
+      const canRetry = next && RETRYABLE_ERRORS.has(error?.message) && deadline - Date.now() >= 2000;
+      if (!canRetry) throw error;
+      console.warn(`Gemini ${attempt.model} ${searchLabel(attempt.search)} failed with ${error.message}; retrying with ${next.model} ${searchLabel(next.search)}.`);
     }
   }
-  throw new Error("GEMINI_QUOTA");
+  throw new Error("GEMINI_REQUEST_FAILED");
 }
 
 // One streamed Gemini call. Returns the text, the raw parts and any function calls; marks a timeout instead of throwing.
@@ -398,6 +405,7 @@ async function streamGemini(model, request, timeoutMs, search) {
       console.error("Gemini request failed with HTTP", status, model, searchLabel(search), detail, quotas ? `Quota: ${quotas}` : "");
       if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
       if (status === 429) throw new Error("GEMINI_QUOTA");
+      if (status >= 500) throw new Error("GEMINI_UNAVAILABLE");
       throw new Error("GEMINI_REQUEST_FAILED");
     }
 
@@ -543,7 +551,8 @@ async function finishInBackground(key, id, question, job) {
     const current = await readPending(key);
     if (current?.id !== id) return;
     await savePending(key, record);
-    console.info(`Background answer saved with status ${record.status}`);
+    if (record.status === "error") console.warn(`Background answer saved with status error: ${record.error}`);
+    else console.info("Background answer saved with status done");
   } catch (error) {
     console.warn("Could not save the background answer to Redis:", error?.message || "unknown error");
   }
@@ -559,6 +568,8 @@ function errorForUser(error) {
       return "Сейчас превышен лимит запросов к Gemini. Попробуйте немного позже.";
     case "GEMINI_BLOCKED":
       return "Я не смогла обработать этот запрос. Попробуйте спросить иначе.";
+    case "GEMINI_UNAVAILABLE":
+      return "Gemini сейчас перегружен. Попробуйте ещё раз через минуту.";
     case "TIME_BUDGET_EXHAUSTED":
       return "Не успела подготовить ответ. Попробуйте задать вопрос ещё раз, чуть короче.";
     default:
