@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { aliceResponse, dateContext, errorForUser, fitAliceText, fitHistoryToBytes, formatSearchContext, isSearchIntent, safeHistory, searchQuery } from "../api/index.js";
+import { aliceResponse, dateContext, errorForUser, fitAliceText, fitHistoryToBytes, formatSearchContext, generationConfigFor, isSearchIntent, safeHistory, searchQuery } from "../api/index.js";
 
 test("Alice response uses required response envelope", () => {
   const result = aliceResponse("Привет", false, [{ role: "user", text: "тест" }]);
@@ -47,6 +47,13 @@ test("schedule questions become a search query and Serper facts are kept", () =>
   });
   assert.match(context, /Арсенал — Челси, 17:30/);
   assert.match(context, /Ливерпуль — Манчестер Сити, 20:00/);
+});
+
+test("Gemini generation stays short and does not enable slow thinking", () => {
+  assert.deepEqual(generationConfigFor("gemini-3.5-flash-lite").thinkingConfig, { thinkingLevel: "minimal" });
+  assert.equal(generationConfigFor("gemini-3.5-flash-lite").maxOutputTokens, 200);
+  assert.deepEqual(generationConfigFor("gemini-2.5-flash").thinkingConfig, { thinkingBudget: 0 });
+  assert.deepEqual(generationConfigFor("gemini-3.8-flash").thinkingConfig, { thinkingLevel: "low" });
 });
 
 test("long responses are cut at a natural boundary and stay within Alice limit", () => {

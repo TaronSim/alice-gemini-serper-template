@@ -4,9 +4,9 @@ const MAX_HISTORY_MESSAGE_CHARS = 300;
 // Yandex rejects responses whose session_state JSON exceeds 1 KB; keep a safety margin.
 const MAX_SESSION_STATE_BYTES = 900;
 const MAX_ALICE_TEXT = 1024;
-const TOTAL_RESPONSE_BUDGET_MS = 4400;
-const SERPER_TIMEOUT_MS = 2400;
-const GEMINI_TIMEOUT_MS = 4100;
+const TOTAL_RESPONSE_BUDGET_MS = 3800;
+const SERPER_TIMEOUT_MS = 1500;
+const GEMINI_TIMEOUT_MS = 2200;
 const DEFAULT_TIME_ZONE = "Europe/Moscow";
 const RU_MONTHS = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"];
 
@@ -57,6 +57,15 @@ function fitAliceText(value) {
 
   const lastSpace = candidate.lastIndexOf(" ");
   return (lastSpace > 200 ? candidate.slice(0, lastSpace) : candidate).trim() + "…";
+}
+
+// Keeps Gemini on the fastest setting. Flash-Lite rejects thinkingBudget 0, older models reject thinkingLevel.
+function generationConfigFor(model) {
+  const config = { temperature: 0.5, maxOutputTokens: 200 };
+  if (/^gemini-2\.5/i.test(model)) config.thinkingConfig = { thinkingBudget: 0 };
+  else if (/flash-lite/i.test(model)) config.thinkingConfig = { thinkingLevel: "minimal" };
+  else if (/^gemini-[3-9]/i.test(model)) config.thinkingConfig = { thinkingLevel: "low" };
+  return config;
 }
 
 function isSearchIntent(text) {
@@ -254,10 +263,7 @@ async function askGemini(text, history, searchContext, timeoutMs, dateLine = "")
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
         contents,
-        generationConfig: {
-          temperature: 0.5,
-          maxOutputTokens: 512
-        }
+        generationConfig: generationConfigFor(model)
       })
     },
     Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
@@ -274,7 +280,7 @@ async function askGemini(text, history, searchContext, timeoutMs, dateLine = "")
 
   const candidate = data?.candidates?.[0];
   const answer = (candidate?.content?.parts || [])
-    .map(part => typeof part.text === "string" ? part.text : "")
+    .map(part => part?.thought || typeof part.text !== "string" ? "" : part.text)
     .join("")
     .trim();
 
@@ -352,7 +358,7 @@ export default async function handler(req, res) {
     let searchContext = "";
     if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
       // Search has a very short budget because Alice expects a response within 4.5 seconds.
-      const found = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 1800)), now, timeZone);
+      const found = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2000)), now, timeZone);
       searchContext = found.context;
       console.info(searchContext ? `Search context attached, ${searchContext.length} chars` : "Search returned no usable text");
       if (found.failed && isScheduleQuestion(text)) {
@@ -386,4 +392,4 @@ export default async function handler(req, res) {
   }
 }
 
-export { aliceResponse, dateContext, errorForUser, fitAliceText, fitHistoryToBytes, formatSearchContext, isSearchIntent, safeHistory, searchQuery };
+export { aliceResponse, dateContext, errorForUser, fitAliceText, fitHistoryToBytes, formatSearchContext, generationConfigFor, isSearchIntent, safeHistory, searchQuery };
