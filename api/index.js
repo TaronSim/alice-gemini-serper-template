@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import { waitUntil } from "@vercel/functions";
 
 const DEFAULT_MODEL = "gemini-3.8-flash";
+// Used when the main model is out of quota (HTTP 429), e.g. when it has no free-tier limit.
+const DEFAULT_FALLBACK_MODEL = "gemini-3.5-flash-lite";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 300;
 // Yandex rejects responses whose session_state JSON exceeds 1 KB; keep a safety margin.
@@ -227,13 +229,35 @@ async function* readSseEvents(body) {
   if (last) yield last;
 }
 
+function modelName(value, fallback) {
+  const model = String(value || fallback).trim();
+  if (!/^[A-Za-z0-9._-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
+  return model;
+}
+
+// Asks the main model and switches to the fallback model once if the main one is out of quota.
 async function askGemini(text, history, { now, timeZone, timeoutMs, allowPartial }) {
+  const deadline = Date.now() + timeoutMs;
+  const model = modelName(process.env.GEMINI_MODEL, DEFAULT_MODEL);
+  const fallback = String(process.env.GEMINI_FALLBACK_MODEL ?? DEFAULT_FALLBACK_MODEL).trim();
+  try {
+    return await askGeminiModel(model, text, history, { now, timeZone, timeoutMs, allowPartial });
+  } catch (error) {
+    if (error?.message !== "GEMINI_QUOTA" || !fallback || fallback === model) throw error;
+    console.warn(`Gemini model ${model} is out of quota; retrying with ${fallback}.`);
+    return askGeminiModel(modelName(fallback), text, history, {
+      now,
+      timeZone,
+      timeoutMs: deadline - Date.now(),
+      allowPartial
+    });
+  }
+}
+
+async function askGeminiModel(model, text, history, { now, timeZone, timeoutMs, allowPartial }) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error("MISSING_GEMINI_KEY");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
-
-  const model = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
-  if (!/^[A-Za-z0-9._-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
 
   const contents = safeHistory(history).map(item => ({
     role: item.role,
@@ -277,7 +301,13 @@ async function askGemini(text, history, { now, timeZone, timeoutMs, allowPartial
       const data = await response.json().catch(() => ({}));
       const status = Number(response.status);
       const detail = String(data?.error?.message || "").slice(0, 300);
-      console.error("Gemini request failed with HTTP", status, detail);
+      // For 429 Google names the exact limit that ran out, e.g. requests per day on the free tier.
+      const quotas = (data?.error?.details || [])
+        .flatMap(item => item?.violations || [])
+        .map(item => item?.quotaId || item?.quotaMetric)
+        .filter(Boolean)
+        .join(", ");
+      console.error("Gemini request failed with HTTP", status, model, detail, quotas ? `Quota: ${quotas}` : "");
       if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
       if (status === 429) throw new Error("GEMINI_QUOTA");
       throw new Error("GEMINI_REQUEST_FAILED");

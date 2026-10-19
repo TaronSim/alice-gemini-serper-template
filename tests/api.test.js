@@ -263,3 +263,27 @@ test("the system prompt keeps only voice-format limits", () => {
   assert.match(prompt, /поиск Google/);
   assert.doesNotMatch(prompt, /1–3 коротких/);
 });
+
+test("an out-of-quota model falls back to the lighter model", async () => {
+  const handler = (await import("../api/index.js")).default;
+  const originalFetch = globalThis.fetch;
+  process.env.GEMINI_API_KEY = "gemini-key";
+  const models = [];
+  globalThis.fetch = async url => {
+    const model = String(url).match(/models\/([^:]+):/)[1];
+    models.push(model);
+    if (model === "gemini-3.8-flash") {
+      return new Response(JSON.stringify({ error: { message: "You exceeded your current quota" } }), { status: 429 });
+    }
+    return geminiSse("Короткий стих готов.");
+  };
+  try {
+    const res = fakeRes();
+    await handler({ method: "POST", body: { request: { command: "сочини короткий стих" } } }, res);
+    assert.deepEqual(models, ["gemini-3.8-flash", "gemini-3.5-flash-lite"]);
+    assert.equal(res.payload.response.text, "Короткий стих готов.");
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete process.env.GEMINI_API_KEY;
+  }
+});
