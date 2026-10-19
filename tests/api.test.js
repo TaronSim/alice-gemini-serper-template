@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { aliceResponse, completeSentences, dateContext, errorForUser, fitAliceText, fitHistoryToBytes, formatSearchContext, generationConfigFor, isContinueCommand, isSearchIntent, safeHistory, searchQuery } from "../api/index.js";
+import { aliceResponse, completeSentences, errorForUser, fitAliceText, fitHistoryToBytes, generationConfigFor, isContinueCommand, safeHistory, systemPrompt, toSpeech } from "../api/index.js";
 
 test("Alice response uses required response envelope", () => {
   const result = aliceResponse("Привет", false, [{ role: "user", text: "тест" }]);
@@ -8,52 +8,6 @@ test("Alice response uses required response envelope", () => {
   assert.equal(result.response.text, "Привет");
   assert.equal(result.response.end_session, false);
   assert.deepEqual(result.session_state.history, [{ role: "user", text: "тест" }]);
-});
-
-test("search intent detects Russian and English freshness requests", () => {
-  assert.equal(isSearchIntent("Какая погода сегодня?"), true);
-  assert.equal(isSearchIntent("What is the latest news?"), true);
-  assert.equal(isSearchIntent("матчи лиги чемпионов завтра"), true);
-  assert.equal(isSearchIntent("какие матчи чемпионата англии сегодня"), true);
-  assert.equal(isSearchIntent("Расскажи сказку"), false);
-  assert.equal(isSearchIntent("сочини короткий стих"), false);
-});
-
-test("schedule questions become a search query and Serper facts are kept", () => {
-  const now = new Date("2026-10-19T12:00:00Z");
-  assert.equal(
-    searchQuery("какие матчи чемпионата англии сегодня", now, "Europe/Moscow"),
-    "какие матчи чемпионата англии 19 октября 2026 расписание"
-  );
-  assert.equal(
-    searchQuery("матчи лиги чемпионов завтра", now, "Europe/Moscow"),
-    "матчи лиги чемпионов 20 октября 2026 расписание"
-  );
-  assert.equal(
-    searchQuery("матчи послезавтра", now, "Europe/Moscow"),
-    "матчи 21 октября 2026 расписание"
-  );
-  assert.equal(
-    searchQuery("матчи завтра", new Date("2026-10-31T12:00:00Z"), "Europe/Moscow"),
-    "матчи 1 ноября 2026 расписание"
-  );
-  assert.equal(searchQuery("сочини короткий стих", now), "сочини короткий стих");
-  assert.match(dateContext("матчи завтра", now, "Europe/Moscow"), /Завтра 20 октября 2026/);
-  assert.match(dateContext("матчи завтра", now, "Not/AZone"), /Europe\/Moscow/);
-
-  const context = formatSearchContext({
-    answerBox: { snippet: "Арсенал — Челси, 17:30" },
-    organic: [{ title: "АПЛ сегодня", snippet: "Ливерпуль — Манчестер Сити, 20:00" }]
-  });
-  assert.match(context, /Арсенал — Челси, 17:30/);
-  assert.match(context, /Ливерпуль — Манчестер Сити, 20:00/);
-});
-
-test("Gemini generation stays short and does not enable slow thinking", () => {
-  assert.deepEqual(generationConfigFor("gemini-3.5-flash-lite").thinkingConfig, { thinkingLevel: "minimal" });
-  assert.equal(generationConfigFor("gemini-3.5-flash-lite").maxOutputTokens, 200);
-  assert.deepEqual(generationConfigFor("gemini-2.5-flash").thinkingConfig, { thinkingBudget: 0 });
-  assert.deepEqual(generationConfigFor("gemini-3.8-flash").thinkingConfig, { thinkingLevel: "low" });
 });
 
 test("long responses are cut at a natural boundary and stay within Alice limit", () => {
@@ -149,30 +103,6 @@ test("requests from another skill are rejected when ALICE_SKILL_ID is set", asyn
   }
 });
 
-test("schedule search timeout says the schedule was not checked", async () => {
-  const handler = (await import("../api/index.js")).default;
-  const originalFetch = globalThis.fetch;
-  process.env.SERPER_API_KEY = "serper-key";
-  process.env.GEMINI_API_KEY = "gemini-key";
-  globalThis.fetch = async (url) => {
-    if (String(url).includes("serper")) throw new DOMException("This operation was aborted", "AbortError");
-    throw new Error("Gemini should not be called");
-  };
-  try {
-    const res = fakeRes();
-    await handler({
-      method: "POST",
-      body: { meta: { timezone: "Europe/Moscow" }, request: { command: "матчи лиги чемпионов завтра" } }
-    }, res);
-    assert.equal(res.statusCode, 200);
-    assert.match(res.payload.response.text, /Не успела проверить расписание/);
-  } finally {
-    globalThis.fetch = originalFetch;
-    delete process.env.SERPER_API_KEY;
-    delete process.env.GEMINI_API_KEY;
-  }
-});
-
 test("Gemini timeout produces the 'не успела' message", async () => {
   const handler = (await import("../api/index.js")).default;
   const originalFetch = globalThis.fetch;
@@ -196,13 +126,6 @@ function geminiSse(text) {
   return new Response(`data: ${JSON.stringify(event)}\r\n\r\n`, {
     status: 200,
     headers: { "Content-Type": "text/event-stream" }
-  });
-}
-
-// Never answers until the request is aborted, like a stuck network call.
-function hangUntilAborted(signal) {
-  return new Promise((_, reject) => {
-    signal.addEventListener("abort", () => reject(new DOMException("This operation was aborted", "AbortError")));
   });
 }
 
@@ -235,35 +158,6 @@ test("slow Gemini stream returns the sentences it already finished", async () =>
     assert.equal(res.payload.response.text, "Жил-был кот.");
   } finally {
     globalThis.fetch = originalFetch;
-    delete process.env.GEMINI_API_KEY;
-  }
-});
-
-test("a slow Serper request is repeated and the faster copy is used", async () => {
-  const handler = (await import("../api/index.js")).default;
-  const originalFetch = globalThis.fetch;
-  process.env.SERPER_API_KEY = "serper-key";
-  process.env.GEMINI_API_KEY = "gemini-key";
-  let serperCalls = 0;
-  let geminiPrompt = "";
-  globalThis.fetch = async (url, options) => {
-    if (String(url).includes("serper")) {
-      serperCalls += 1;
-      if (serperCalls === 1) return hangUntilAborted(options.signal);
-      return new Response(JSON.stringify({ organic: [{ title: "АПЛ", snippet: "Арсенал — Челси, 19:30" }] }));
-    }
-    geminiPrompt = JSON.stringify(JSON.parse(options.body).contents);
-    return geminiSse("Сегодня Арсенал играет с Челси в 19:30.");
-  };
-  try {
-    const res = fakeRes();
-    await handler({ method: "POST", body: { request: { command: "какие матчи чемпионата англии на этой неделе" } } }, res);
-    assert.equal(serperCalls, 2);
-    assert.match(geminiPrompt, /Арсенал — Челси, 19:30/);
-    assert.equal(res.payload.response.text, "Сегодня Арсенал играет с Челси в 19:30.");
-  } finally {
-    globalThis.fetch = originalFetch;
-    delete process.env.SERPER_API_KEY;
     delete process.env.GEMINI_API_KEY;
   }
 });
@@ -315,4 +209,57 @@ test("with Redis a late answer is finished in the background and given on 'да�
     delete process.env.UPSTASH_REDIS_REST_URL;
     delete process.env.UPSTASH_REDIS_REST_TOKEN;
   }
+});
+
+test("Gemini picks its own thinking depth unless GEMINI_THINKING_LEVEL is set", () => {
+  assert.deepEqual(generationConfigFor("gemini-3.8-flash", ""), { maxOutputTokens: 8192 });
+  assert.deepEqual(generationConfigFor("gemini-3.8-flash", "Low").thinkingConfig, { thinkingLevel: "low" });
+  assert.equal(generationConfigFor("gemini-2.5-flash", "low").thinkingConfig, undefined);
+});
+
+test("Markdown from Gemini becomes plain speech", () => {
+  assert.equal(
+    toSpeech("## Матчи\n- **Ливерпуль** — Вильярреал\n- [ПСЖ](https://x.y) — Барселона\nПодробнее: https://example.com"),
+    "Матчи. Ливерпуль — Вильярреал. ПСЖ — Барселона. Подробнее:"
+  );
+});
+
+test("Gemini gets Google Search, the current date and the user's time zone", async () => {
+  const handler = (await import("../api/index.js")).default;
+  const originalFetch = globalThis.fetch;
+  process.env.GEMINI_API_KEY = "gemini-key";
+  let request;
+  globalThis.fetch = async (url, options) => {
+    assert.match(String(url), /gemini-3\.8-flash:streamGenerateContent\?alt=sse/);
+    request = JSON.parse(options.body);
+    return geminiSse("Сегодня в АПЛ играют Тоттенхэм и Ковентри.");
+  };
+  try {
+    const res = fakeRes();
+    await handler({
+      method: "POST",
+      body: { meta: { timezone: "Asia/Yerevan" }, request: { command: "какие матчи чемпионата англии сегодня" } }
+    }, res);
+    assert.deepEqual(request.tools, [{ google_search: {} }]);
+    const instruction = request.systemInstruction.parts[0].text;
+    assert.match(instruction, /Asia\/Yerevan/);
+    assert.match(instruction, /20\d\d/);
+    assert.equal(request.contents.at(-1).parts[0].text, "какие матчи чемпионата англии сегодня");
+    assert.equal(res.payload.response.text, "Сегодня в АПЛ играют Тоттенхэм и Ковентри.");
+
+    process.env.GEMINI_GOOGLE_SEARCH = "off";
+    await handler({ method: "POST", body: { request: { command: "сочини стих" } } }, fakeRes());
+    assert.equal(request.tools, undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete process.env.GEMINI_API_KEY;
+    delete process.env.GEMINI_GOOGLE_SEARCH;
+  }
+});
+
+test("the system prompt keeps only voice-format limits", () => {
+  const prompt = systemPrompt(new Date("2026-10-19T12:00:00Z"), "Europe/Moscow");
+  assert.match(prompt, /19 октября 2026/);
+  assert.match(prompt, /поиск Google/);
+  assert.doesNotMatch(prompt, /1–3 коротких/);
 });
