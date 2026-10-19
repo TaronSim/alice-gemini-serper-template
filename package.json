@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Minimal Vercel webhook for a Yandex Alice skill powered by Gemini with Google Search grounding",
+  "description": "Minimal Vercel webhook for a Yandex Alice skill powered by Gemini that searches the web through Serper",
   "engines": {
     "node": ">=22"
   },

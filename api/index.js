@@ -4,6 +4,20 @@ import { waitUntil } from "@vercel/functions";
 const DEFAULT_MODEL = "gemini-3.8-flash";
 // Used when the main model is out of quota (HTTP 429), e.g. when it has no free-tier limit.
 const DEFAULT_FALLBACK_MODEL = "gemini-3.5-flash-lite";
+const SERPER_TIMEOUT_MS = 5000;
+const MAX_SEARCH_ROUNDS = 2;
+// Gemini decides itself when to search, like with the built-in Google Search, but the search runs through Serper.
+const SEARCH_TOOL = {
+  functionDeclarations: [{
+    name: "search_web",
+    description: "Поиск Google. Используй для вопросов о свежих событиях, спорте, расписаниях, новостях, погоде, ценах, курсах и для фактов, в которых не уверен. Пиши в запросе конкретную дату вместо слов «сегодня» или «завтра».",
+    parameters: {
+      type: "object",
+      properties: { query: { type: "string", description: "Поисковый запрос" } },
+      required: ["query"]
+    }
+  }]
+};
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 300;
 // Yandex rejects responses whose session_state JSON exceeds 1 KB; keep a safety margin.
@@ -235,18 +249,101 @@ function modelName(value, fallback) {
   return model;
 }
 
-// Tries the main model with Google Search, then the fallback model with search, then the fallback model without it.
-// Each step runs only when the previous one is out of quota (HTTP 429).
+function clipText(value, max) {
+  return String(value ?? "").replace(/\s+/g, " ").trim().slice(0, max);
+}
+
+// Collects the parts of a Serper response that can actually contain facts, not only three short snippets.
+function formatSearchContext(data) {
+  const lines = [];
+  const box = data?.answerBox;
+  const answer = box?.answer || box?.snippet;
+  if (answer) lines.push(`Краткий ответ: ${clipText(answer, 500)}`);
+
+  if (Array.isArray(box?.list)) {
+    const list = box.list
+      .map(item => clipText(typeof item === "string" ? item : item?.title || item?.snippet, 140))
+      .filter(Boolean)
+      .slice(0, 8);
+    if (list.length) lines.push(`Список: ${list.join("; ")}`);
+  }
+
+  const graph = data?.knowledgeGraph;
+  if (graph?.title || graph?.description) {
+    const attrs = graph.attributes && typeof graph.attributes === "object"
+      ? Object.entries(graph.attributes).slice(0, 8).map(([key, value]) => `${key}: ${clipText(value, 80)}`).join("; ")
+      : "";
+    lines.push(`Карточка: ${clipText(graph.title, 120)}. ${clipText(graph.description, 300)}${attrs ? ` ${attrs}` : ""}`.trim());
+  }
+
+  const sports = data?.sportsResults || data?.sports_results;
+  if (sports) lines.push(`Спорт: ${clipText(JSON.stringify(sports), 900)}`);
+
+  for (const item of (Array.isArray(data?.organic) ? data.organic : []).slice(0, 6)) {
+    const snippet = clipText(item?.snippet, 320);
+    if (snippet) lines.push(`${clipText(item?.title, 140)}: ${snippet}`);
+  }
+
+  for (const item of (Array.isArray(data?.peopleAlsoAsk) ? data.peopleAlsoAsk : []).slice(0, 2)) {
+    if (item?.snippet) lines.push(`Ещё: ${clipText(item.question, 80)} ${clipText(item.snippet, 220)}`);
+  }
+
+  return lines.join("\n").slice(0, 2200);
+}
+
+// Runs a web search that Gemini asked for through the search_web function.
+async function searchWeb(query, timeoutMs) {
+  const key = process.env.SERPER_API_KEY;
+  const q = clipText(query, 200);
+  if (!key || !q) return "Поиск недоступен.";
+  if (timeoutMs < 300) return "Поиск не успел выполниться.";
+  console.info(`Gemini searched the web: ${q}`);
+
+  try {
+    const { response, data } = await fetchJson(
+      "https://google.serper.dev/search",
+      {
+        method: "POST",
+        headers: {
+          "X-API-KEY": key,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ q, gl: "ru", hl: "ru", num: 8 })
+      },
+      Math.min(SERPER_TIMEOUT_MS, timeoutMs)
+    );
+    if (!response.ok) {
+      console.warn("Serper request failed with HTTP", response.status);
+      return "Поиск не удался.";
+    }
+    return formatSearchContext(data) || "Ничего не найдено.";
+  } catch {
+    console.warn("Serper request did not finish in time.");
+    return "Поиск не успел выполниться.";
+  }
+}
+
+function searchLabel(search) {
+  if (search === "google") return "with Google Search";
+  if (search === "serper") return "with Serper search";
+  return "without search";
+}
+
+// Built-in Google Search needs a paid Gemini tier, so it is opt-in; otherwise Gemini searches through Serper.
+// On HTTP 429 the next attempt runs: the main model without Google Search, then the fallback model.
 async function askGemini(text, history, { now, timeZone, timeoutMs, allowPartial }) {
   const deadline = Date.now() + timeoutMs;
   const model = modelName(process.env.GEMINI_MODEL, DEFAULT_MODEL);
   const fallback = modelName(process.env.GEMINI_FALLBACK_MODEL, DEFAULT_FALLBACK_MODEL);
-  const search = String(process.env.GEMINI_GOOGLE_SEARCH || "").trim().toLowerCase() !== "off";
-  const attempts = [{ model, search }];
-  if (fallback !== model) attempts.push({ model: fallback, search });
-  if (search) attempts.push({ model: fallback, search: false });
+  const setting = String(process.env.GEMINI_GOOGLE_SEARCH || "").trim().toLowerCase();
+  const webSearch = setting !== "off" && process.env.SERPER_API_KEY ? "serper" : "none";
+  const attempts = setting === "on"
+    ? [{ model, search: "google" }, { model, search: webSearch }, { model: fallback, search: webSearch }]
+    : [{ model, search: webSearch }, { model: fallback, search: webSearch }];
+  const unique = attempts.filter((item, index) =>
+    attempts.findIndex(other => other.model === item.model && other.search === item.search) === index);
 
-  for (const [index, attempt] of attempts.entries()) {
+  for (const [index, attempt] of unique.entries()) {
     try {
       return await askGeminiModel(attempt.model, text, history, {
         now,
@@ -256,40 +353,23 @@ async function askGemini(text, history, { now, timeZone, timeoutMs, allowPartial
         search: attempt.search
       });
     } catch (error) {
-      const next = attempts[index + 1];
+      const next = unique[index + 1];
       if (error?.message !== "GEMINI_QUOTA" || !next) throw error;
-      console.warn(`Gemini ${attempt.model}${attempt.search ? " with Google Search" : ""} is out of quota; retrying with ${next.model}${next.search ? " with Google Search" : " without Google Search"}.`);
+      console.warn(`Gemini ${attempt.model} ${searchLabel(attempt.search)} is out of quota; retrying with ${next.model} ${searchLabel(next.search)}.`);
     }
   }
   throw new Error("GEMINI_QUOTA");
 }
 
-async function askGeminiModel(model, text, history, { now, timeZone, timeoutMs, allowPartial, search }) {
+// One streamed Gemini call. Returns the text, the raw parts and any function calls; marks a timeout instead of throwing.
+async function streamGemini(model, request, timeoutMs, search) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error("MISSING_GEMINI_KEY");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
 
-  const contents = safeHistory(history).map(item => ({
-    role: item.role,
-    parts: [{ text: item.text }]
-  }));
-  contents.push({ role: "user", parts: [{ text }] });
-
-  const request = {
-    systemInstruction: { parts: [{ text: systemPrompt(now, timeZone) }] },
-    contents,
-    generationConfig: generationConfigFor(model)
-  };
-  // Grounding with Google Search: Gemini decides itself what to look up, as in the Gemini app.
-  if (search) request.tools = [{ google_search: {} }];
-
-  // Streaming lets us keep the sentences Gemini has already written when time runs out.
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), Math.max(100, timeoutMs));
-  let collected = "";
-  let finishReason = "";
-  let blockReason = "";
-  const searches = new Set();
+  const step = { text: "", parts: [], calls: [], finishReason: "", blockReason: "", searches: new Set(), timedOut: false };
 
   try {
     const response = await fetch(
@@ -309,14 +389,13 @@ async function askGeminiModel(model, text, history, { now, timeZone, timeoutMs, 
       const data = await response.json().catch(() => ({}));
       const status = Number(response.status);
       const detail = String(data?.error?.message || "").slice(0, 300);
-      // For 429 Google names the exact limit that ran out, e.g. requests per day on the free tier.
+      // For 429 Google may name the exact limit that ran out, e.g. requests per day on the free tier.
       const quotas = (data?.error?.details || [])
         .flatMap(item => item?.violations || [])
         .map(item => item?.quotaId || item?.quotaMetric)
         .filter(Boolean)
         .join(", ");
-      console.error("Gemini request failed with HTTP", status, model, search ? "with Google Search" : "without Google Search", detail, quotas ? `Quota: ${quotas}` : "");
-      if (status === 429) console.error("Gemini 429 details:", JSON.stringify(data?.error?.details || data?.error || {}).slice(0, 1500));
+      console.error("Gemini request failed with HTTP", status, model, searchLabel(search), detail, quotas ? `Quota: ${quotas}` : "");
       if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
       if (status === 429) throw new Error("GEMINI_QUOTA");
       throw new Error("GEMINI_REQUEST_FAILED");
@@ -324,34 +403,81 @@ async function askGeminiModel(model, text, history, { now, timeZone, timeoutMs, 
 
     for await (const event of readSseEvents(response.body)) {
       const candidate = event?.candidates?.[0];
-      collected += (candidate?.content?.parts || [])
-        .map(part => part?.thought || typeof part?.text !== "string" ? "" : part.text)
-        .join("");
-      finishReason = candidate?.finishReason || finishReason;
-      blockReason = event?.promptFeedback?.blockReason || blockReason;
-      for (const query of candidate?.groundingMetadata?.webSearchQueries || []) searches.add(query);
+      for (const part of candidate?.content?.parts || []) {
+        if (!part || part.thought) continue;
+        // Gemini 3 needs its parts (with thought signatures) sent back unchanged after a function call.
+        step.parts.push(part);
+        if (typeof part.text === "string") step.text += part.text;
+        if (part.functionCall) step.calls.push(part.functionCall);
+      }
+      step.finishReason = candidate?.finishReason || step.finishReason;
+      step.blockReason = event?.promptFeedback?.blockReason || step.blockReason;
+      for (const query of candidate?.groundingMetadata?.webSearchQueries || []) step.searches.add(query);
     }
   } catch (error) {
     if (error?.name !== "AbortError") throw error;
-    const partial = allowPartial ? toSpeech(completeSentences(collected)) : "";
-    if (!partial) throw new Error("TIME_BUDGET_EXHAUSTED");
-    console.warn("Gemini ran out of time; returning the sentences it finished.");
-    return partial;
+    step.timedOut = true;
   } finally {
     clearTimeout(timer);
   }
+  return step;
+}
 
-  if (searches.size) console.info(`Gemini searched Google: ${[...searches].join(" | ").slice(0, 300)}`);
-  const answer = toSpeech(collected);
-  if (!answer) {
-    if (blockReason) throw new Error("GEMINI_BLOCKED");
-    throw new Error("GEMINI_EMPTY_RESPONSE");
+async function askGeminiModel(model, text, history, { now, timeZone, timeoutMs, allowPartial, search }) {
+  const deadline = Date.now() + timeoutMs;
+  const contents = safeHistory(history).map(item => ({
+    role: item.role,
+    parts: [{ text: item.text }]
+  }));
+  contents.push({ role: "user", parts: [{ text }] });
+
+  for (let round = 0; ; round += 1) {
+    const request = {
+      systemInstruction: { parts: [{ text: systemPrompt(now, timeZone) }] },
+      contents,
+      generationConfig: generationConfigFor(model)
+    };
+    if (search === "google") request.tools = [{ google_search: {} }];
+    if (search === "serper") {
+      request.tools = [SEARCH_TOOL];
+      // After enough searches Gemini must answer with what it found.
+      if (round >= MAX_SEARCH_ROUNDS) request.toolConfig = { functionCallingConfig: { mode: "NONE" } };
+    }
+
+    const step = await streamGemini(model, request, deadline - Date.now(), search);
+
+    if (step.timedOut) {
+      const partial = allowPartial && !step.calls.length ? toSpeech(completeSentences(step.text)) : "";
+      if (!partial) throw new Error("TIME_BUDGET_EXHAUSTED");
+      console.warn("Gemini ran out of time; returning the sentences it finished.");
+      return partial;
+    }
+
+    if (search === "serper" && step.calls.length && round < MAX_SEARCH_ROUNDS) {
+      const results = await Promise.all(step.calls.map(call =>
+        call?.name === "search_web" ? searchWeb(call?.args?.query, deadline - Date.now() - 1500) : "Неизвестная функция."));
+      contents.push({ role: "model", parts: step.parts });
+      contents.push({
+        role: "user",
+        parts: step.calls.map((call, index) => ({
+          functionResponse: { ...(call?.id ? { id: call.id } : {}), name: call?.name, response: { result: results[index] } }
+        }))
+      });
+      continue;
+    }
+
+    if (step.searches.size) console.info(`Gemini searched Google: ${[...step.searches].join(" | ").slice(0, 300)}`);
+    const answer = toSpeech(step.text);
+    if (!answer) {
+      if (step.blockReason) throw new Error("GEMINI_BLOCKED");
+      throw new Error("GEMINI_EMPTY_RESPONSE");
+    }
+    if (step.finishReason === "MAX_TOKENS") {
+      console.warn("Gemini reached the output token limit.");
+      return completeSentences(answer) || answer;
+    }
+    return answer;
   }
-  if (finishReason === "MAX_TOKENS") {
-    console.warn("Gemini reached the output token limit.");
-    return completeSentences(answer) || answer;
-  }
-  return answer;
 }
 
 function isContinueCommand(text) {
