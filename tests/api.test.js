@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { aliceResponse, errorForUser, fitAliceText, fitHistoryToBytes, formatSearchContext, isSearchIntent, safeHistory, searchQuery } from "../api/index.js";
+import { aliceResponse, dateContext, errorForUser, fitAliceText, fitHistoryToBytes, formatSearchContext, isSearchIntent, safeHistory, searchQuery } from "../api/index.js";
 
 test("Alice response uses required response envelope", () => {
   const result = aliceResponse("Привет", false, [{ role: "user", text: "тест" }]);
@@ -20,8 +20,26 @@ test("search intent detects Russian and English freshness requests", () => {
 });
 
 test("schedule questions become a search query and Serper facts are kept", () => {
-  assert.equal(searchQuery("какие матчи чемпионата англии сегодня"), "какие матчи чемпионата англии сегодня расписание");
-  assert.equal(searchQuery("сочини короткий стих"), "сочини короткий стих");
+  const now = new Date("2026-10-19T12:00:00Z");
+  assert.equal(
+    searchQuery("какие матчи чемпионата англии сегодня", now, "Europe/Moscow"),
+    "какие матчи чемпионата англии 19 октября 2026 расписание"
+  );
+  assert.equal(
+    searchQuery("матчи лиги чемпионов завтра", now, "Europe/Moscow"),
+    "матчи лиги чемпионов 20 октября 2026 расписание"
+  );
+  assert.equal(
+    searchQuery("матчи послезавтра", now, "Europe/Moscow"),
+    "матчи 21 октября 2026 расписание"
+  );
+  assert.equal(
+    searchQuery("матчи завтра", new Date("2026-10-31T12:00:00Z"), "Europe/Moscow"),
+    "матчи 1 ноября 2026 расписание"
+  );
+  assert.equal(searchQuery("сочини короткий стих", now), "сочини короткий стих");
+  assert.match(dateContext("матчи завтра", now, "Europe/Moscow"), /Завтра 20 октября 2026/);
+  assert.match(dateContext("матчи завтра", now, "Not/AZone"), /Europe\/Moscow/);
 
   const context = formatSearchContext({
     answerBox: { snippet: "Арсенал — Челси, 17:30" },
@@ -121,6 +139,30 @@ test("requests from another skill are rejected when ALICE_SKILL_ID is set", asyn
     assert.match(ok.payload.response.text, /Привет/);
   } finally {
     delete process.env.ALICE_SKILL_ID;
+  }
+});
+
+test("schedule search timeout says the schedule was not checked", async () => {
+  const handler = (await import("../api/index.js")).default;
+  const originalFetch = globalThis.fetch;
+  process.env.SERPER_API_KEY = "serper-key";
+  process.env.GEMINI_API_KEY = "gemini-key";
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("serper")) throw new DOMException("This operation was aborted", "AbortError");
+    throw new Error("Gemini should not be called");
+  };
+  try {
+    const res = fakeRes();
+    await handler({
+      method: "POST",
+      body: { meta: { timezone: "Europe/Moscow" }, request: { command: "матчи лиги чемпионов завтра" } }
+    }, res);
+    assert.equal(res.statusCode, 200);
+    assert.match(res.payload.response.text, /Не успела проверить расписание/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete process.env.SERPER_API_KEY;
+    delete process.env.GEMINI_API_KEY;
   }
 });
 

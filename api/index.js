@@ -5,16 +5,19 @@ const MAX_HISTORY_MESSAGE_CHARS = 300;
 const MAX_SESSION_STATE_BYTES = 900;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 4400;
-const SERPER_TIMEOUT_MS = 1800;
+const SERPER_TIMEOUT_MS = 2400;
 const GEMINI_TIMEOUT_MS = 4100;
+const DEFAULT_TIME_ZONE = "Europe/Moscow";
+const RU_MONTHS = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"];
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
   "Отвечай естественно, по-русски, кратко и так, чтобы ответ было удобно слушать.",
   "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления.",
-  "Если переданы результаты поиска, отвечай по ним. Для расписания и результатов назови найденные матчи: кто играет, во сколько и с каким счётом.",
-  "Не говори, что данных нет, если в тексте уже есть команды, время или счёт. Не выдумывай факты, которых в результатах нет.",
-  "Если не знаешь ответа и поиск ничего не дал, честно скажи об этом."
+  "Если переданы результаты поиска, отвечай только по ним.",
+  "Если вопрос про сегодня, завтра или конкретный день, называй матчи только этой даты. Если в тексте другая дата, скажи, что на запрошенный день таких матчей нет, и назови ближайшую дату из текста.",
+  "Время произноси так, как оно написано в источнике. Не добавляй «утра» или «вечера» и не переводи время в другой пояс.",
+  "Не выдумывай факты, которых в результатах нет. Если поиск ничего не дал, честно скажи об этом."
 ].join(" ");
 
 function aliceResponse(text, endSession = false, history = []) {
@@ -60,13 +63,74 @@ function isSearchIntent(text) {
   return /\b(latest|today|current|news|weather|price|exchange rate|recent|search|look up)\b|сегодня|сейчас|завтра|последн|новост|погод|курс валют|найди|поищи|актуальн|сколько стоит|свежие данные|матч|расписан|результат|чемпионат/i.test(text);
 }
 
-// Turns a spoken question into a shorter web query. Schedule questions get an extra keyword.
-function searchQuery(text) {
-  const query = String(text ?? "").replace(/\s+/g, " ").trim().slice(0, 180);
-  if (/матч|чемпионат|лиг|расписан|результат|сч[её]т/i.test(query) && !/расписан/i.test(query)) {
-    return `${query} расписание`;
+// Accepts an IANA zone from Alice and falls back to Moscow when the value is missing or invalid.
+function resolveTimeZone(value) {
+  const zone = String(value || "").trim() || DEFAULT_TIME_ZONE;
+  try {
+    Intl.DateTimeFormat("ru-RU", { timeZone: zone });
+    return zone;
+  } catch {
+    return DEFAULT_TIME_ZONE;
   }
-  return query;
+}
+
+// Reads the calendar day in the user's time zone.
+function zonedParts(date, timeZone) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(date);
+  const read = type => Number(parts.find(part => part.type === type).value);
+  return { year: read("year"), month: read("month"), day: read("day") };
+}
+
+// Moves a calendar day forward without crossing a zone boundary at midnight.
+function shiftZonedDate(date, timeZone, days) {
+  const { year, month, day } = zonedParts(date, timeZone);
+  return new Date(Date.UTC(year, month - 1, day + days, 12));
+}
+
+// Formats a zoned calendar day as "19 октября 2026".
+function formatRuDate(date, timeZone) {
+  const { year, month, day } = zonedParts(date, timeZone);
+  return `${day} ${RU_MONTHS[month - 1]} ${year}`;
+}
+
+function hasWord(text, word) {
+  return new RegExp(`(?<![\\p{L}\\p{N}])${word}(?![\\p{L}\\p{N}])`, "iu").test(text);
+}
+
+function replaceWord(text, word, value) {
+  return text.replace(new RegExp(`(?<![\\p{L}\\p{N}])${word}(?![\\p{L}\\p{N}])`, "giu"), value);
+}
+
+function isScheduleQuestion(text) {
+  return /матч|расписан|чемпионат|лиг|результат|сч[её]т/i.test(text);
+}
+
+// Tells the model which calendar day the user means.
+function dateContext(text, now = new Date(), timeZone = DEFAULT_TIME_ZONE) {
+  const zone = resolveTimeZone(timeZone);
+  const today = formatRuDate(now, zone);
+  const tomorrow = formatRuDate(shiftZonedDate(now, zone, 1), zone);
+  let asked = `сегодня, ${today}`;
+  if (hasWord(text, "послезавтра")) asked = `послезавтра, ${formatRuDate(shiftZonedDate(now, zone, 2), zone)}`;
+  else if (hasWord(text, "завтра")) asked = `завтра, ${tomorrow}`;
+  else if (!hasWord(text, "сегодня") && !hasWord(text, "сейчас")) asked = "день не указан";
+  return `Сейчас ${today}, часовой пояс ${zone}. Завтра ${tomorrow}. Пользователь спрашивает про: ${asked}.`;
+}
+
+// Turns a spoken question into a web query with an absolute date instead of "сегодня" or "завтра".
+function searchQuery(text, now = new Date(), timeZone = DEFAULT_TIME_ZONE) {
+  const zone = resolveTimeZone(timeZone);
+  let query = String(text ?? "").replace(/\s+/g, " ").trim();
+  query = replaceWord(query, "послезавтра", formatRuDate(shiftZonedDate(now, zone, 2), zone));
+  query = replaceWord(query, "завтра", formatRuDate(shiftZonedDate(now, zone, 1), zone));
+  query = replaceWord(query, "сегодня", formatRuDate(now, zone));
+  if (isScheduleQuestion(query) && !/расписан/i.test(query)) query = `${query} расписание`;
+  return query.slice(0, 180);
 }
 
 function clipText(value, max) {
@@ -131,9 +195,9 @@ async function fetchJson(url, options, timeoutMs) {
   }
 }
 
-async function searchWeb(query, timeoutMs) {
+async function searchWeb(query, timeoutMs, now = new Date(), timeZone = DEFAULT_TIME_ZONE) {
   const key = process.env.SERPER_API_KEY;
-  if (!key || timeoutMs < 150) return "";
+  if (!key || timeoutMs < 150) return { context: "", failed: false };
 
   try {
     const { response, data } = await fetchJson(
@@ -144,24 +208,24 @@ async function searchWeb(query, timeoutMs) {
           "X-API-KEY": key,
           "Content-Type": "application/json"
         },
-        body: JSON.stringify({ q: searchQuery(query), gl: "ru", hl: "ru", num: 8 })
+        body: JSON.stringify({ q: searchQuery(query, now, timeZone), gl: "ru", hl: "ru", num: 8 })
       },
       Math.min(SERPER_TIMEOUT_MS, timeoutMs)
     );
 
     if (!response.ok) {
       console.warn("Serper request failed with HTTP", response.status);
-      return "";
+      return { context: "", failed: true };
     }
 
-    return formatSearchContext(data);
+    return { context: formatSearchContext(data), failed: false };
   } catch (error) {
     console.warn("Serper request did not finish in time; continuing without search.");
-    return "";
+    return { context: "", failed: true };
   }
 }
 
-async function askGemini(text, history, searchContext, timeoutMs) {
+async function askGemini(text, history, searchContext, timeoutMs, dateLine = "") {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error("MISSING_GEMINI_KEY");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
@@ -175,7 +239,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   }));
 
   const prompt = searchContext
-    ? `${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nНазови команды, время и счёт, если они есть в тексте. Не выдумывай матчи, которых там нет.`
+    ? `${dateLine}\n\nВопрос: ${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nЕсли дата в результатах не совпадает с запрошенным днём, так и скажи. Время называй как в тексте, без перевода.`
     : text;
   contents.push({ role: "user", parts: [{ text: prompt }] });
 
@@ -283,18 +347,29 @@ export default async function handler(req, res) {
   }
 
   try {
+    const now = new Date();
+    const timeZone = resolveTimeZone(body?.meta?.timezone);
     let searchContext = "";
     if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
       // Search has a very short budget because Alice expects a response within 4.5 seconds.
-      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2300)));
+      const found = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 1800)), now, timeZone);
+      searchContext = found.context;
       console.info(searchContext ? `Search context attached, ${searchContext.length} chars` : "Search returned no usable text");
+      if (found.failed && isScheduleQuestion(text)) {
+        return res.status(200).json(aliceResponse(
+          "Не успела проверить расписание. Спросите ещё раз чуть позже.",
+          false,
+          oldHistory
+        ));
+      }
     }
 
     const answer = await askGemini(
       text,
       oldHistory,
       searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 250))
+      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 250)),
+      searchContext ? dateContext(text, now, timeZone) : ""
     );
 
     const history = [
@@ -311,4 +386,4 @@ export default async function handler(req, res) {
   }
 }
 
-export { aliceResponse, errorForUser, fitAliceText, fitHistoryToBytes, formatSearchContext, isSearchIntent, safeHistory, searchQuery };
+export { aliceResponse, dateContext, errorForUser, fitAliceText, fitHistoryToBytes, formatSearchContext, isSearchIntent, safeHistory, searchQuery };
