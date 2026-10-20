@@ -12,6 +12,11 @@ const SPORTS_LOOKAHEAD_DAYS = 7;
 const FALLBACK_RESERVE_MS = 9000;
 // Errors after which the next model is tried: out of quota, overloaded, or too slow.
 const RETRYABLE_ERRORS = new Set(["GEMINI_QUOTA", "GEMINI_UNAVAILABLE", "TIME_BUDGET_EXHAUSTED"]);
+// An overloaded or out-of-quota model answers with an error only after ~2 seconds, which Alice cannot spare.
+// Such a model is skipped for a while; the cooldown lives in this instance's memory.
+const COOLDOWN_ERRORS = new Set(["GEMINI_QUOTA", "GEMINI_UNAVAILABLE"]);
+const MODEL_COOLDOWN_MS = 60000;
+const cooldownUntil = new Map();
 // Leagues with full fixture lists in ESPN's free public scoreboard.
 const FOOTBALL_LEAGUES = {
   "uefa.champions": "Лига чемпионов",
@@ -431,6 +436,14 @@ function runTool(call, timeZone, timeoutMs) {
   return Promise.resolve("Неизвестная функция.");
 }
 
+function attemptKey(attempt) {
+  return `${attempt.model}|${attempt.search}`;
+}
+
+function resetModelCooldowns() {
+  cooldownUntil.clear();
+}
+
 function searchLabel(search) {
   if (search === "google") return "with Google Search";
   if (search === "tools") return "with search tools";
@@ -450,9 +463,13 @@ async function askGemini(text, history, { now, timeZone, timeoutMs, allowPartial
     : [{ model, search: webSearch }, { model: fallback, search: webSearch }];
   const unique = attempts.filter((item, index) =>
     attempts.findIndex(other => other.model === item.model && other.search === item.search) === index);
+  const ready = unique.filter(item => !(cooldownUntil.get(attemptKey(item)) > Date.now()));
+  // When every attempt is cooling down, the last one is still tried rather than giving up.
+  const queue = ready.length ? ready : unique.slice(-1);
+  if (queue.length < unique.length) console.info(`Skipping models that failed recently; starting with ${queue[0].model} ${searchLabel(queue[0].search)}.`);
 
-  for (const [index, attempt] of unique.entries()) {
-    const next = unique[index + 1];
+  for (const [index, attempt] of queue.entries()) {
+    const next = queue[index + 1];
     const left = deadline - Date.now();
     const reserve = next && left >= 2 * FALLBACK_RESERVE_MS ? FALLBACK_RESERVE_MS : 0;
     try {
@@ -464,6 +481,7 @@ async function askGemini(text, history, { now, timeZone, timeoutMs, allowPartial
         search: attempt.search
       });
     } catch (error) {
+      if (next && COOLDOWN_ERRORS.has(error?.message)) cooldownUntil.set(attemptKey(attempt), Date.now() + MODEL_COOLDOWN_MS);
       const canRetry = next && RETRYABLE_ERRORS.has(error?.message) && deadline - Date.now() >= 2000;
       if (!canRetry) throw error;
       console.warn(`Gemini ${attempt.model} ${searchLabel(attempt.search)} failed with ${error.message}; retrying with ${next.model} ${searchLabel(next.search)}.`);
@@ -774,4 +792,4 @@ export default async function handler(req, res) {
   }
 }
 
-export { aliceResponse, completeSentences, errorForUser, fitAliceText, footballMatches, fitHistoryToBytes, generationConfigFor, isContinueCommand, safeHistory, systemPrompt, toSpeech };
+export { aliceResponse, completeSentences, errorForUser, fitAliceText, footballMatches, fitHistoryToBytes, generationConfigFor, isContinueCommand, resetModelCooldowns, safeHistory, systemPrompt, toSpeech };

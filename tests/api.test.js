@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { aliceResponse, completeSentences, errorForUser, fitAliceText, fitHistoryToBytes, generationConfigFor, isContinueCommand, safeHistory, systemPrompt, toSpeech } from "../api/index.js";
+import { aliceResponse, completeSentences, errorForUser, fitAliceText, fitHistoryToBytes, generationConfigFor, isContinueCommand, resetModelCooldowns, safeHistory, systemPrompt, toSpeech } from "../api/index.js";
 
 test("Alice response uses required response envelope", () => {
   const result = aliceResponse("Привет", false, [{ role: "user", text: "тест" }]);
@@ -288,6 +288,7 @@ test("an out-of-quota model falls back to the lighter model", async () => {
   } finally {
     globalThis.fetch = originalFetch;
     delete process.env.GEMINI_API_KEY;
+    resetModelCooldowns();
   }
 });
 
@@ -315,6 +316,7 @@ test("when Google Search is out of quota, Gemini answers without it and then via
     globalThis.fetch = originalFetch;
     delete process.env.GEMINI_API_KEY;
     delete process.env.GEMINI_GOOGLE_SEARCH;
+    resetModelCooldowns();
   }
 });
 
@@ -375,9 +377,15 @@ test("an overloaded main model (HTTP 503) falls back to the light model", async 
     await handler({ method: "POST", body: { request: { command: "сочини короткий стих" } } }, res);
     assert.deepEqual(models, ["gemini-3.8-flash", "gemini-3.5-flash-lite"]);
     assert.equal(res.payload.response.text, "Стих от запасной модели.");
+
+    // The next question does not wait for the overloaded model again.
+    models.length = 0;
+    await handler({ method: "POST", body: { request: { command: "ещё один стих" } } }, fakeRes());
+    assert.deepEqual(models, ["gemini-3.5-flash-lite"]);
   } finally {
     globalThis.fetch = originalFetch;
     delete process.env.GEMINI_API_KEY;
+    resetModelCooldowns();
   }
 });
 
