@@ -188,6 +188,7 @@ test("with Redis a late answer is finished in the background and given on 'да�
     const first = fakeRes();
     await handler({ method: "POST", body: { session, request: { command: "расскажи сказку" } } }, first);
     assert.match(first.payload.response.text, /Скажите «дальше»/);
+    assert.deepEqual(first.payload.response.buttons, [{ title: "Дальше", hide: true }]);
 
     releaseGemini();
     for (let i = 0; i < 50 && !String(store.get("alice:pending:session-1")).includes('"done"'); i += 1) {
@@ -211,9 +212,9 @@ test("with Redis a late answer is finished in the background and given on 'да�
   }
 });
 
-test("Gemini picks its own thinking depth unless GEMINI_THINKING_LEVEL is set", () => {
-  assert.deepEqual(generationConfigFor("gemini-3.8-flash", ""), { maxOutputTokens: 8192 });
-  assert.deepEqual(generationConfigFor("gemini-3.8-flash", "Low").thinkingConfig, { thinkingLevel: "low" });
+test("Gemini 3 thinks at low level by default so Alice gets an answer in time", () => {
+  assert.deepEqual(generationConfigFor("gemini-3.8-flash", ""), { maxOutputTokens: 8192, thinkingConfig: { thinkingLevel: "low" } });
+  assert.deepEqual(generationConfigFor("gemini-3.8-flash", "High").thinkingConfig, { thinkingLevel: "high" });
   assert.equal(generationConfigFor("gemini-2.5-flash", "low").thinkingConfig, undefined);
 });
 

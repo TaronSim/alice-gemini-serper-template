@@ -4,6 +4,7 @@ import { waitUntil } from "@vercel/functions";
 const DEFAULT_MODEL = "gemini-3.8-flash";
 // Used when the main model is out of quota (HTTP 429), e.g. when it has no free-tier limit.
 const DEFAULT_FALLBACK_MODEL = "gemini-3.5-flash-lite";
+const DEFAULT_THINKING_LEVEL = "low";
 const SERPER_TIMEOUT_MS = 5000;
 const MAX_TOOL_ROUNDS = 3;
 const SPORTS_LOOKAHEAD_DAYS = 7;
@@ -57,7 +58,7 @@ const MAX_ALICE_TEXT = 1024;
 // Without Redis everything must fit into Alice's ~4.5 seconds.
 const TOTAL_RESPONSE_BUDGET_MS = 3800;
 // With Redis a slow answer is finished in the background, so Gemini gets as much time as in its own app.
-const SOFT_DEADLINE_MS = 3400;
+const SOFT_DEADLINE_MS = 3800;
 const BACKGROUND_GEMINI_TIMEOUT_MS = 25000;
 const CONTINUE_WAIT_MS = 3300;
 const PENDING_TTL_SEC = 600;
@@ -67,6 +68,8 @@ const CONTINUE_COMMANDS = new Set([
   "дальше", "ну дальше", "продолжи", "продолжай", "что там", "ну что", "ну что там", "и что",
   "ну", "готово", "ответ", "какой ответ", "скажи ответ", "нашла", "ну как", "что нашла"
 ]);
+// On screens the user can tap instead of saying "дальше".
+const CONTINUE_BUTTONS = [{ title: "Дальше", hide: true }];
 const DEFAULT_TIME_ZONE = "Europe/Moscow";
 
 // Only the voice format is restricted; the content should be what Gemini would answer in its own chat.
@@ -92,13 +95,15 @@ function systemPrompt(now = new Date(), timeZone = DEFAULT_TIME_ZONE) {
   ].join(" ");
 }
 
-function aliceResponse(text, endSession = false, history = []) {
+function aliceResponse(text, endSession = false, history = [], buttons = []) {
+  const response = {
+    text: fitAliceText(text),
+    end_session: endSession
+  };
+  if (buttons.length) response.buttons = buttons;
   return {
     version: "1.0",
-    response: {
-      text: fitAliceText(text),
-      end_session: endSession
-    },
+    response,
     session_state: { history: fitHistoryToBytes(history) }
   };
 }
@@ -146,11 +151,12 @@ function toSpeech(value) {
     .trim();
 }
 
-// Gemini 3 picks its own thinking depth, like in the Gemini app; GEMINI_THINKING_LEVEL can override it.
+// Gemini 3 defaults to high thinking, which takes seconds even for "привет" and misses Alice's deadline.
+// Voice needs low by default; GEMINI_THINKING_LEVEL can override it.
 function generationConfigFor(model, thinkingLevel = process.env.GEMINI_THINKING_LEVEL) {
   // Thinking tokens count toward this limit, so it is generous; the prompt keeps the spoken part short.
   const config = { maxOutputTokens: 8192 };
-  const level = String(thinkingLevel || "").trim().toLowerCase();
+  const level = String(thinkingLevel || DEFAULT_THINKING_LEVEL).trim().toLowerCase();
   if (level && /^gemini-[3-9]/i.test(model)) config.thinkingConfig = { thinkingLevel: level };
   return config;
 }
@@ -475,6 +481,9 @@ async function streamGemini(model, request, timeoutMs, search) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), Math.max(100, timeoutMs));
   const step = { text: "", parts: [], calls: [], finishReason: "", blockReason: "", searches: new Set(), timedOut: false };
+  // Logged so slow answers can be traced to thinking, tools or the network in the Vercel logs.
+  const startedAt = Date.now();
+  let firstChunkMs = -1;
 
   try {
     const response = await fetch(
@@ -508,6 +517,7 @@ async function streamGemini(model, request, timeoutMs, search) {
     }
 
     for await (const event of readSseEvents(response.body)) {
+      if (firstChunkMs < 0) firstChunkMs = Date.now() - startedAt;
       const candidate = event?.candidates?.[0];
       for (const part of candidate?.content?.parts || []) {
         if (!part || part.thought) continue;
@@ -526,6 +536,8 @@ async function streamGemini(model, request, timeoutMs, search) {
   } finally {
     clearTimeout(timer);
   }
+  const outcome = step.timedOut ? "timed out" : step.calls.length ? `called ${step.calls.map(call => call?.name).join(", ")}` : "answered";
+  console.info(`Gemini ${model} ${searchLabel(search)} ${outcome}: first chunk ${firstChunkMs < 0 ? "none" : `${firstChunkMs} ms`}, total ${Date.now() - startedAt} ms`);
   return step;
 }
 
@@ -626,7 +638,7 @@ async function deliverPending(key, history, startedAt) {
     runLater(redisCommand(["DEL", key]).catch(() => {}));
     return aliceResponse(errorForUser(new Error(record.error)), false, history);
   }
-  return aliceResponse(STILL_SEARCHING_TEXT, false, history);
+  return aliceResponse(STILL_SEARCHING_TEXT, false, history, CONTINUE_BUTTONS);
 }
 
 // Stores the late answer; skips it when the user has already moved on to another question.
@@ -754,7 +766,7 @@ export default async function handler(req, res) {
 
     runLater(finishInBackground(pendingKey, randomUUID(), text, job));
     console.info("Answer is not ready yet; finishing it in the background.");
-    return res.status(200).json(aliceResponse(SEARCHING_TEXT, false, oldHistory));
+    return res.status(200).json(aliceResponse(SEARCHING_TEXT, false, oldHistory, CONTINUE_BUTTONS));
   } catch (error) {
     const safeError = normalizeError(error);
     console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
